@@ -4,7 +4,9 @@
 Reads billing document PDFs, asks an LLM to extract structured fields, post-processes
 the answer in plain Python, matches the vendor against vendors.csv, checks for
 duplicates/math errors/OCR conflicts, renames a copy of the PDF, and writes
-results.json / review.csv / quickbooks_bills.csv + a summary table.
+results.json / review.csv (with a bookkeeper `reviewed` column) + a summary table.
+`--export` (no model/OCR calls) turns reviewed=="ok" rows into quickbooks_bills.csv /
+quickbooks_expenses.csv and appends them to ledger.csv.
 """
 import argparse
 import csv
@@ -42,12 +44,15 @@ po_number (string or null)
 currency (string or null -- ISO code; "USD" when a $ sign is seen)
 subtotal (number or null)
 tax (number or null)
+shipping (number or null -- freight/shipping/delivery charge line, if printed)
+discount (number or null -- discount amount as a POSITIVE number (the amount subtracted), if printed)
 total (number or null -- the grand total printed on the document)
 amount_due (number or null -- balance due if printed separately, else same as total)
 payment_terms (string or null -- e.g. "Net 30", "Due on receipt")
 line_items (list of {{"description": string, "quantity": number or null, "unit_price": number or null, "amount": number or null}})
 bill_to (string or null)
 payment_method_seen (bool -- a card/cash/"paid" payment line is visible, e.g. on a receipt)
+payment_method (string or null -- how it was paid, as printed, e.g. "VISA 4477", "Cash", "Check 1042")
 marked_paid (bool -- a PAID stamp or handwritten "paid" note is visible)
 missing_info (list of strings -- fields present on the page but unreadable)
 summary (one sentence string)
@@ -281,12 +286,15 @@ def make_error_record(source_file: str, error: str) -> dict:
         "currency": None,
         "subtotal": None,
         "tax": None,
+        "shipping": None,
+        "discount": None,
         "total": None,
         "amount_due": None,
         "payment_terms": None,
         "line_items": [],
         "bill_to": None,
         "payment_method_seen": False,
+        "payment_method": None,
         "marked_paid": False,
         "missing_info": ["could not parse model response"],
         "summary": f"Extraction failed: {error}",
@@ -417,11 +425,14 @@ def compute_due(due_date_raw, terms, invoice_date) -> str:
 
 
 def math_check(data: dict) -> str:
-    """sum(line items) vs subtotal, and subtotal+tax vs total (tolerance 0.02 each).
-    When subtotal is null but line items + total exist, checks sum(lines)+tax vs total."""
+    """sum(line items) vs subtotal, and subtotal - discount + shipping + tax vs total
+    (tolerance 0.02 each; missing shipping/discount/tax count as 0). When subtotal is
+    null but line items + total exist, uses sum(lines) in place of subtotal."""
     items = data.get("line_items") or []
     subtotal = data.get("subtotal")
     tax = data.get("tax") or 0
+    shipping = data.get("shipping") or 0
+    discount = data.get("discount") or 0
     total = data.get("total")
     amounts = [i.get("amount") for i in items if i.get("amount") is not None]
     lines_sum = sum(amounts) if amounts and len(amounts) == len(items) else None
@@ -429,12 +440,13 @@ def math_check(data: dict) -> str:
     notes = []
     if lines_sum is not None and subtotal is not None and abs(lines_sum - subtotal) > 0.02:
         notes.append(f"lines sum {lines_sum:.2f}, subtotal {subtotal:.2f}")
-    if subtotal is not None and total is not None:
-        if abs(subtotal + tax - total) > 0.02:
-            notes.append(f"subtotal + tax {subtotal + tax:.2f}, total {total:.2f}")
-    elif subtotal is None and lines_sum is not None and total is not None:
-        if abs(lines_sum + tax - total) > 0.02:
-            notes.append(f"lines + tax {lines_sum + tax:.2f}, total {total:.2f}")
+
+    effective_subtotal = subtotal if subtotal is not None else lines_sum
+    if effective_subtotal is not None and total is not None:
+        expected = effective_subtotal - discount + shipping + tax
+        if abs(expected - total) > 0.02:
+            label = "subtotal" if subtotal is not None else "lines"
+            notes.append(f"{label} - discount + shipping + tax {expected:.2f}, total {total:.2f}")
     return "; ".join(notes)
 
 
@@ -533,6 +545,8 @@ def apply_rules(data: dict, vendors: list, ledger: list, today, earlier_records:
         vendor_canon = vendor_canon.title()
     data["vendor_on_list"] = bool(vendor_row)
     data["vendor"] = vendor_canon
+    # QuickBooks display name: vendors.csv qbo_vendor_name, else the canonical vendor_name.
+    data["qbo_vendor"] = (vendor_row.get("qbo_vendor_name") if vendor_row else None) or vendor_canon
     data["category"] = (vendor_row.get("default_category") if vendor_row else "") or ""
     terms = data.get("payment_terms") or (vendor_row.get("default_terms") if vendor_row else "") or ""
     data["terms"] = terms
@@ -541,6 +555,8 @@ def apply_rules(data: dict, vendors: list, ledger: list, today, earlier_records:
     data["amount_due"] = parse_money(data.get("amount_due"))
     data["subtotal"] = parse_money(data.get("subtotal"))
     data["tax"] = parse_money(data.get("tax"))
+    data["shipping"] = parse_money(data.get("shipping"))
+    data["discount"] = parse_money(data.get("discount"))
     for item in data.get("line_items") or []:
         item["quantity"] = parse_money(item.get("quantity"))
         item["unit_price"] = parse_money(item.get("unit_price"))
@@ -561,6 +577,7 @@ def apply_rules(data: dict, vendors: list, ledger: list, today, earlier_records:
             (row.get("vendor"), row.get("invoice_no"), parse_money(row.get("total")),
              parse_date(row.get("date")), row.get("source_file") or "ledger")
             for row in ledger
+            if row.get("source_file") != data.get("source_file")  # a rerun must not flag itself
         ]
         candidates += [
             (rec.get("vendor") or rec.get("vendor_name"), rec.get("invoice_number"), rec.get("total"),
@@ -587,10 +604,17 @@ def apply_rules(data: dict, vendors: list, ledger: list, today, earlier_records:
 # ---------------------------------------------------------------------------
 
 REVIEW_FIELDS = ["file", "type", "vendor", "invoice_no", "date", "due", "total", "category",
-                  "flags", "notes", "needs_review", "new_file"]
+                  "flags", "notes", "needs_review", "new_file", "reviewed"]
 
 QBO_FIELDS = ["BillNo", "Supplier", "BillDate", "DueDate", "Terms", "Location", "Memo", "Account",
               "LineDescription", "LineAmount", "LineTaxCode", "LineTaxAmount", "Currency"]
+
+# SaasAnt Transactions expense-import template (verified field names/order).
+QBO_EXPENSE_FIELDS = ["Ref No", "Payee", "Account", "Payment Date", "Payment Method", "Memo",
+                       "Category Account", "Category Description", "Category Line Amount",
+                       "Currency Code"]
+
+LEDGER_FIELDS = ["vendor", "invoice_no", "date", "total", "source_file"]
 
 
 def to_review_row(record: dict) -> dict:
@@ -608,7 +632,37 @@ def to_review_row(record: dict) -> dict:
         "notes": "; ".join(record.get("notes") or []),
         "needs_review": "True" if record.get("needs_review") else "False",
         "new_file": record.get("new_file") or "",
+        "reviewed": record.get("reviewed") or "",
     }
+
+
+def export_lines(record: dict) -> list:
+    """(description, amount) pairs whose sum equals the document total. Line items are
+    used only when every amount is present and they add up (with tax, shipping and
+    discount); otherwise one line for the total. An import that does not balance is
+    worse than one coarse line."""
+    total = record.get("total")
+    tax = record.get("tax") or 0
+    shipping = record.get("shipping") or 0
+    discount = record.get("discount") or 0
+    items = record.get("line_items") or []
+    amounts = [i.get("amount") for i in items]
+    lines = []
+    if items and all(a is not None for a in amounts):
+        lines = [(i.get("description") or "", a) for i, a in zip(items, amounts)]
+        if shipping:
+            lines.append(("Shipping", shipping))
+        if discount:
+            lines.append(("Discount", -discount))
+        if tax:
+            lines.append(("Sales tax", tax))
+        if total is not None and abs(sum(a for _, a in lines) - total) > 0.02:
+            lines = []
+    if not lines and total is not None:
+        lines = [(record.get("summary") or "", total - tax)]
+        if tax:
+            lines.append(("Sales tax", tax))
+    return lines
 
 
 def qbo_rows(record: dict) -> list:
@@ -621,7 +675,7 @@ def qbo_rows(record: dict) -> list:
         return []
     base = {
         "BillNo": record.get("invoice_number") or "",
-        "Supplier": record.get("vendor") or "",
+        "Supplier": record.get("qbo_vendor") or record.get("vendor") or "",
         "BillDate": record.get("invoice_date") or "",
         "DueDate": record.get("due") or "",
         "Terms": record.get("terms") or "",
@@ -632,25 +686,45 @@ def qbo_rows(record: dict) -> list:
         "LineTaxAmount": "",
         "Currency": record.get("currency") or "USD",
     }
-    rows = []
-    items = record.get("line_items") or []
-    if items:
-        for item in items:
-            amount = item.get("amount")
-            rows.append({**base, "LineDescription": item.get("description") or "",
-                         "LineAmount": f"{amount:.2f}" if amount is not None else ""})
-    else:
-        amount = record.get("subtotal") if record.get("subtotal") is not None else record.get("total")
-        rows.append({**base, "LineDescription": record.get("summary") or "",
-                     "LineAmount": f"{amount:.2f}" if amount is not None else ""})
-    tax = record.get("tax")
-    if tax:
-        rows.append({**base, "LineDescription": "Sales tax", "LineAmount": f"{tax:.2f}"})
-    return rows
+    return [{**base, "LineDescription": desc, "LineAmount": f"{amount:.2f}"}
+            for desc, amount in export_lines(record)]
+
+
+def normalize_payment_method(raw) -> str:
+    """As-printed payment text -> a QBO payment method bucket."""
+    s = (raw or "").lower()
+    if any(k in s for k in ("visa", "mastercard", "amex", "discover", "card")):
+        return "Credit Card"
+    if "cash" in s:
+        return "Cash"
+    if "check" in s or "cheque" in s:
+        return "Check"
+    return raw or ""
+
+
+def qbo_expense_rows(record: dict) -> list:
+    """One QBO expense-import row per line item (+ a sales-tax row). Receipts only,
+    excludes DUPLICATE (a receipt marked_paid never applies -- see compute_flags)."""
+    if record.get("document_type") != "receipt":
+        return []
+    if "DUPLICATE" in (record.get("flags") or []):
+        return []
+    base = {
+        "Ref No": record.get("invoice_number") or "",
+        "Payee": record.get("qbo_vendor") or record.get("vendor") or "",
+        "Account": "",  # the bank/card account -- bookkeeper fills this in
+        "Payment Date": record.get("invoice_date") or "",
+        "Payment Method": normalize_payment_method(record.get("payment_method")),
+        "Memo": record.get("source_file") or "",
+        "Category Account": record.get("category") or "",
+        "Currency Code": record.get("currency") or "USD",
+    }
+    return [{**base, "Category Description": desc, "Category Line Amount": f"{amount:.2f}"}
+            for desc, amount in export_lines(record)]
 
 
 def print_summary_table(records: list) -> None:
-    cols = ("file", "type", "vendor", "invoice_no", "total", "due", "flags", "needs_review")
+    cols = ("file", "type", "vendor", "invoice_no", "total", "due", "flags", "needs_review", "reviewed")
     rows = [cols]
     for r in records:
         row = to_review_row(r)
@@ -658,6 +732,23 @@ def print_summary_table(records: list) -> None:
     widths = [max(len(row[i]) for row in rows) for i in range(len(cols))]
     for row in rows:
         print(" | ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)))
+
+
+def read_reviewed_map(review_csv_path: Path) -> dict:
+    """{source_file: reviewed value} from an existing review.csv, or {} if there isn't one."""
+    review_csv_path = Path(review_csv_path)
+    if not review_csv_path.exists():
+        return {}
+    with review_csv_path.open(newline="") as f:
+        return {row["file"]: row.get("reviewed", "") for row in csv.DictReader(f)}
+
+
+def compute_reviewed(source_file: str, needs_review: bool, prior_map: dict) -> str:
+    """Carry over the bookkeeper's existing mark; only pre-fill when the file is new
+    (no row for it in the previous review.csv): "ok" when clean, "" when flagged."""
+    if source_file in prior_map:
+        return prior_map[source_file]
+    return "" if needs_review else "ok"
 
 
 def process_dir(input_dir: Path, output_dir: Path, model: str, base_url: str = None,
@@ -670,6 +761,7 @@ def process_dir(input_dir: Path, output_dir: Path, model: str, base_url: str = N
     if results_path.exists():
         existing = json.loads(results_path.read_text())
         done_sources = {r["source_file"] for r in existing}
+    prior_reviewed = read_reviewed_map(output_dir / "review.csv")
 
     vendors = load_vendors(vendors_path)
     ledger = load_ledger(ledger_path)
@@ -703,6 +795,7 @@ def process_dir(input_dir: Path, output_dir: Path, model: str, base_url: str = N
         apply_rules(data, vendors, ledger, today, clean_so_far)
         data["new_file"] = build_new_filename(data.get("vendor"), data.get("invoice_number"),
                                               data.get("invoice_date"), used_names)
+        data["reviewed"] = compute_reviewed(data["source_file"], data["needs_review"], prior_reviewed)
         if pdf.exists():
             shutil.copy2(pdf, output_dir / data["new_file"])
         clean_so_far.append(data)
@@ -716,20 +809,94 @@ def process_dir(input_dir: Path, output_dir: Path, model: str, base_url: str = N
         for r in records:
             writer.writerow(to_review_row(r))
 
+    return records
+
+
+def export_dir(output_dir: Path, ledger_path="ledger.csv") -> None:
+    """--export: read output_dir/review.csv + results.json (no model/OCR calls) and, for
+    rows marked reviewed=="ok", write quickbooks_bills.csv (invoices) and
+    quickbooks_expenses.csv (receipts), then append exported rows to ledger.csv (idempotent
+    on source_file). Both QBO CSVs are rewritten fully each call."""
+    output_dir = Path(output_dir)
+    results = json.loads((output_dir / "results.json").read_text())
+    by_file = {r["source_file"]: r for r in results}
+    reviewed_map = read_reviewed_map(output_dir / "review.csv")
+
+    bill_rows, expense_rows, ledger_additions = [], [], []
+    n_bills = n_expenses = held = skipped = 0
+    for source_file, reviewed in reviewed_map.items():
+        record = by_file.get(source_file)
+        if record is None:
+            continue
+        if reviewed == "skip":
+            skipped += 1
+            continue
+        if reviewed != "ok":
+            held += 1
+            continue
+        doc_type = record.get("document_type")
+        if doc_type == "invoice":
+            rows = qbo_rows(record)
+            if rows:
+                bill_rows += rows
+                n_bills += 1
+                ledger_additions.append(record)
+            else:
+                print(f"  warning: {source_file} marked ok but excluded by flags "
+                      f"({';'.join(record.get('flags') or [])}), not exported")
+        elif doc_type == "receipt":
+            rows = qbo_expense_rows(record)
+            if rows:
+                expense_rows += rows
+                n_expenses += 1
+                ledger_additions.append(record)
+            else:
+                print(f"  warning: {source_file} marked ok but excluded by flags "
+                      f"({';'.join(record.get('flags') or [])}), not exported")
+        else:
+            print(f"  warning: {source_file} marked ok but document_type={doc_type}, not exported")
+
     with (output_dir / "quickbooks_bills.csv").open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=QBO_FIELDS)
         writer.writeheader()
-        for r in records:
-            for row in qbo_rows(r):
-                writer.writerow(row)
+        writer.writerows(bill_rows)
+    with (output_dir / "quickbooks_expenses.csv").open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=QBO_EXPENSE_FIELDS)
+        writer.writeheader()
+        writer.writerows(expense_rows)
 
-    return records
+    ledger = load_ledger(ledger_path)
+    seen_sources = {row.get("source_file") for row in ledger}
+    for record in ledger_additions:
+        if record.get("source_file") in seen_sources:
+            continue
+        total = record.get("total")
+        ledger.append({
+            "vendor": record.get("vendor") or "",
+            "invoice_no": record.get("invoice_number") or "",
+            "date": record.get("invoice_date") or "",
+            "total": f"{total:.2f}" if total is not None else "",
+            "source_file": record.get("source_file") or "",
+        })
+        seen_sources.add(record.get("source_file"))
+    with Path(ledger_path).open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=LEDGER_FIELDS)
+        writer.writeheader()
+        writer.writerows(ledger)
+
+    print(f"exported {n_bills} bills, {n_expenses} expenses; {held} held (blank), "
+          f"{skipped} skipped; ledger now {len(ledger)} rows")
 
 
 def main():
     ap = argparse.ArgumentParser(description="Capture and triage inbound invoices.")
-    ap.add_argument("input_dir", nargs="?", default="invoices_in")
+    ap.add_argument("input_dir", nargs="?", default="invoices_in",
+                    help="With --export, this positional is read as the output_dir instead.")
     ap.add_argument("output_dir", nargs="?", default="invoices_out")
+    ap.add_argument("--export", action="store_true",
+                    help="Export reviewed=='ok' rows from an existing output dir to the "
+                         "QuickBooks CSVs and ledger.csv. No model or OCR calls. "
+                         "Usage: capture.py --export [output_dir]")
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--base-url", default=None,
                     help="OpenAI-compatible endpoint, e.g. https://opencode.ai/zen/go/v1 "
@@ -740,6 +907,13 @@ def main():
     ap.add_argument("--vendors", default="vendors.csv")
     ap.add_argument("--ledger", default="ledger.csv")
     args = ap.parse_args()
+
+    if args.export:
+        # --export takes one optional positional (output_dir); argparse still fills it
+        # into the first positional slot ("input_dir"), whose own default doesn't apply here.
+        out_dir = args.input_dir if args.input_dir != "invoices_in" else "invoices_out"
+        export_dir(Path(out_dir), args.ledger)
+        return
 
     api_key = load_api_key(args.api_key_env) if args.base_url else None
     if args.base_url and not api_key and "localhost" not in args.base_url:

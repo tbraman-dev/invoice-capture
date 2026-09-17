@@ -14,7 +14,14 @@ Makes 20 fake documents in `invoices_in/`.
 ```
 python capture.py
 ```
-Reads `invoices_in/`, writes renamed copies plus `results.json`, `review.csv`, and `quickbooks_bills.csv` into `invoices_out/`. Reruns skip files already done. Delete `invoices_out/` to start over.
+Reads `invoices_in/` and extracts vendor, invoice number, date, total, line items, and payment details. Writes renamed copies, `results.json`, and `review.csv` into `invoices_out/`. Reruns skip files already done. Delete `invoices_out/` to start over.
+
+Open `invoices_out/review.csv`, check the `reviewed` column, and mark each row as "ok" (import it) or "skip" (do not import). Clean rows with no flags are pre-filled "ok".
+
+```
+python capture.py --export
+```
+Reads `invoices_out/review.csv` and `results.json`. Rows marked "ok" are written to `quickbooks_bills.csv` (invoices) and `quickbooks_expenses.csv` (receipts). Appends exported rows to `ledger.csv` (skips duplicates). Prints a summary.
 
 ```
 python test_capture.py
@@ -43,8 +50,11 @@ Scores `invoices_out/review.csv` against `expected.json` (the known answer for e
 | notes | lines sum 412.00, subtotal 421.00 |
 | needs_review | True |
 | new_file | northwind_supply_inv20240142_20260915.pdf |
+| reviewed | ok |
 
-**quickbooks_bills.csv** — ready to import to QuickBooks Online. One row per line item (bill details repeated). Includes only invoices that are not marked paid or flagged as duplicates.
+**quickbooks_bills.csv** — ready to import to QuickBooks Online. One row per line item (bill details repeated). Only invoices marked "ok" in review.csv.
+
+**quickbooks_expenses.csv** — ready to import to QuickBooks Online. One row per line item. Only receipts marked "ok" in review.csv. Columns: Ref No, Payee, Account, Payment Date, Payment Method, Memo, Category Account, Category Description, Category Line Amount, Currency Code. Account is the bank or card account the bookkeeper fills in; Category Account is the expense category. SaasAnt maps columns by name, so the extra Payment Method column is harmless.
 
 **Renamed PDFs** — moved to `invoices_out/` with safe names for filing.
 
@@ -56,7 +66,7 @@ Scores `invoices_out/review.csv` against `expected.json` (the known answer for e
 - `CREDIT_MEMO` — credit note (skip QuickBooks)
 - `DUPLICATE` — same vendor + invoice number as an earlier file or ledger
 - `MARKED_PAID` — has a paid stamp visible (skip QuickBooks)
-- `MATH_ERROR` — line items do not add up (tolerance ±0.02)
+- `MATH_ERROR` — line items, shipping, and discount do not add up to total (tolerance ±0.02)
 - `TOTAL_CONFLICT` — printed totals do not match model extraction (tolerance ±0.01)
 - `OVERDUE` — due date is in the past
 - `DUE_SOON` — due within 7 days
@@ -93,9 +103,20 @@ Override today's date (for testing due-date flags). Format: YYYY-MM-DD.
 
 ## Data files
 
-**vendors.csv** — vendor reference list. The bookkeeper maintains this per client. Columns: `vendor_name`, `default_category`, `default_terms`, `notes`. Used to match vendor names, fill missing terms, and route to QuickBooks categories.
+**vendors.csv** — vendor reference list. The bookkeeper maintains this per client. Columns: `vendor_name`, `qbo_vendor_name`, `default_category`, `default_terms`, `notes`. 
+
+- `vendor_name`: the name as it appears on invoices (canonical).
+- `qbo_vendor_name`: the vendor display name in the client's QuickBooks. Leave blank if it matches `vendor_name`.
+- `default_category`: must be the exact account name from the client's QuickBooks chart of accounts.
+- `default_terms` and `notes`: as before.
+
+If you import a vendor or category name that does not match exactly, QuickBooks creates a new one.
 
 **ledger.csv** — already-captured bills. Checked to flag duplicates. Columns: `vendor`, `invoice_no`, `date`, `total`, `source_file`.
+
+## Receipts
+
+QuickBooks Online does not have a built-in CSV import for expenses (only for bank transactions). The `quickbooks_expenses.csv` file uses the SaasAnt Transactions format, a third-party tool commonly used by bookkeepers to import receipt expenses into QuickBooks.
 
 ## Other models
 

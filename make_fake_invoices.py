@@ -166,7 +166,8 @@ def line_item_table(draw, x0, y, items, grid=True, width=1600):
     return y + 10
 
 
-def totals_block(draw, x, y, subtotal, tax, total, credit=False, right_edge=1620):
+def totals_block(draw, x, y, subtotal, tax, total, credit=False, right_edge=1620,
+                  shipping=None, discount=None):
     def row(label, value_str, bold=False):
         nonlocal y
         f = font(25, bold=bold)
@@ -176,6 +177,10 @@ def totals_block(draw, x, y, subtotal, tax, total, credit=False, right_edge=1620
         y += 40
 
     row("Subtotal:", money(subtotal))
+    if shipping:
+        row("Shipping:", money(shipping))
+    if discount:
+        row("Discount:", f"-{money(discount)}")
     if tax:
         row("Tax:", money(tax))
     total_str = f"-{money(total)}" if credit else money(total)
@@ -273,14 +278,18 @@ def render_invoice(spec):
         y2 = 140
         y2 = line_item_table(d2, 60, y2, rest, grid=grid)
         y2 += 40
-        totals_block(d2, 1120, y2, spec["subtotal"], spec["tax"], spec["total"], credit=spec.get("credit", False))
+        totals_block(d2, 1120, y2, spec["subtotal"], spec["tax"], spec["total"],
+                     credit=spec.get("credit", False), shipping=spec.get("shipping"),
+                     discount=spec.get("discount"))
         p2 = finalize_page(img2)
         pages.append(p2)
         return pages
 
     y = line_item_table(d, 60, y, items, grid=grid)
     y += 40
-    totals_block(d, 1120, y, spec["subtotal"], spec["tax"], spec["total"], credit=spec.get("credit", False))
+    totals_block(d, 1120, y, spec["subtotal"], spec["tax"], spec["total"],
+                 credit=spec.get("credit", False), shipping=spec.get("shipping"),
+                 discount=spec.get("discount"))
 
     if spec.get("paid_stamp"):
         stamp_paid(img, ["PAID", "9/12"])
@@ -304,7 +313,8 @@ def add_shadow_gradient(strip):
 
 
 def render_receipt(store, address, phone, receipt_date, items, total,
-                    receipt_no=None, shadow=False, faint=False, tax=None):
+                    receipt_no=None, shadow=False, faint=False, tax=None,
+                    payment_line="VISA ****4477  APPROVED"):
     strip_w = 900
     strip = Image.new("L", (strip_w, 1700), color=255)
     d = ImageDraw.Draw(strip)
@@ -349,7 +359,7 @@ def render_receipt(store, address, phone, receipt_date, items, total,
     tw = d.textlength(money(total), font=f)
     d.text((strip_w - 50 - tw, y), money(total), font=f, fill=0)
     y += 50
-    y = center_text("VISA ****4477  APPROVED", 20, y)
+    y = center_text(payment_line, 20, y)
     y += 16
     y = center_text("THANK YOU FOR SHOPPING WITH US", 22, y)
     y += 20
@@ -627,7 +637,8 @@ def build_doc10():
     items = [("Unleaded fuel, 14.2 gal", 58.40)]
     total = 58.40
     rdate = dt(-1)
-    page = render_receipt(v["name"], v["address"], v["phone"], rdate, items, total)
+    page = render_receipt(v["name"], v["address"], v["phone"], rdate, items, total,
+                           payment_line="CASH TENDERED $60.00 CHANGE $1.60")
     add_expected("scan_0010.pdf", type="receipt", vendor=v["name"], invoice_no="",
                  date=fmt_date(rdate), due="", total=exp_total(total),
                  flags="", needs_review="False", category=v["category"])
@@ -639,7 +650,8 @@ def build_doc11():
     items = [("Drip coffee, large", 3.25), ("Blueberry muffin", 3.50)]
     total = 6.75
     rdate = dt(-3)
-    page = render_receipt(name, address, phone, rdate, items, total, faint=True)
+    page = render_receipt(name, address, phone, rdate, items, total, faint=True,
+                           payment_line="MASTERCARD ****9910")
     add_expected("scan_0011.pdf", type="receipt", vendor=name, invoice_no="",
                  date=fmt_date(rdate), due="", total=exp_total(total),
                  flags="UNKNOWN_VENDOR", needs_review="True", category="")
@@ -778,19 +790,63 @@ def build_doc20():
     return pages
 
 
+def build_doc21():
+    v = V["northwind"]
+    items = [
+        ("Copy paper, letter size, case of 10 reams", 20, 6.25, 125.00),
+        ("Toner cartridge, black (HP compatible)", 3, 85.00, 255.00),
+    ]
+    subtotal, shipping, tax, total = 380.00, 45.00, 30.40, 455.40
+    invoice_date, due_date = dt(0), dt(30)
+    spec = dict(vendor=v["name"], address=v["address"], phone=v["phone"], email=v["email"],
+                invoice_no="INV-10475", invoice_date=invoice_date, due_date=due_date,
+                due_label=v["terms"], items=items, subtotal=subtotal, shipping=shipping,
+                tax=tax, total=total, layout="grid_left")
+    pages = render_invoice(spec)
+    add_expected("scan_0021.pdf", type="invoice", vendor=v["name"], invoice_no="INV-10475",
+                 date=fmt_date(invoice_date), due=fmt_date(due_date), total=exp_total(total),
+                 flags="", needs_review="False", category=v["category"])
+    return pages
+
+
+def build_doc22():
+    v = V["blueanchor"]
+    items = [
+        ("Annual subscription - Team plan", 1, 1200.00, 1200.00),
+        ("Add-on seats", 10, 40.00, 400.00),
+    ]
+    subtotal, discount, tax, total = 1600.00, 50.00, 0.00, 1550.00
+    invoice_date, due_date = dt(0), dt(25)
+    spec = dict(vendor=v["name"], address=v["address"], phone=v["phone"], email=v["email"],
+                invoice_no="BAS-5610", invoice_date=invoice_date, due_date=due_date,
+                due_label=v["terms"], items=items, subtotal=subtotal, discount=discount,
+                tax=tax, total=total, layout="twocol")
+    pages = render_invoice(spec)
+    add_expected("scan_0022.pdf", type="invoice", vendor=v["name"], invoice_no="BAS-5610",
+                 date=fmt_date(invoice_date), due=fmt_date(due_date), total=exp_total(total),
+                 flags="", needs_review="False", category=v["category"])
+    return pages
+
+
 # ---------------------------------------------------------------------------
 # vendors.csv / ledger.csv
 # ---------------------------------------------------------------------------
+
+QBO_VENDOR_NAMES = {
+    "northwind": "Northwind Supply",
+    "apex": "Apex Repair and Maintenance",
+}
+
 
 def write_vendors_csv():
     path = os.path.join(HERE, "vendors.csv")
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["vendor_name", "default_category", "default_terms", "notes"])
+        w.writerow(["vendor_name", "qbo_vendor_name", "default_category", "default_terms", "notes"])
         for key in ("northwind", "cedarridge", "blueanchor", "granitepeak", "apex",
                     "fieldstone", "silverline", "maple", "quikfuel"):
             v = V[key]
-            w.writerow([v["name"], v["category"], v.get("terms", ""), ""])
+            w.writerow([v["name"], QBO_VENDOR_NAMES.get(key, ""), v["category"], v.get("terms", ""), ""])
     return path
 
 
@@ -848,6 +904,8 @@ def main():
     save_pdf(build_doc18(), "scan_0018.pdf")
     save_pdf(build_doc19(), "scan_0019.pdf")
     save_pdf(build_doc20(), "scan_0020.pdf")
+    save_pdf(build_doc21(), "scan_0021.pdf")
+    save_pdf(build_doc22(), "scan_0022.pdf")
 
     write_vendors_csv()
     write_ledger_csv()
@@ -878,6 +936,17 @@ def demo():
     assert money(1234.5) == "$1,234.50"
     assert exp_total(-180.0) == "-180.00"
     assert EXPECTED["scan_0001.pdf"]["flags"] == ""
+
+    # shipping/discount totals-box branch (round 2): render both and check
+    # the printed total agrees with subtotal - discount + shipping + tax.
+    pages21 = build_doc21()
+    assert len(pages21) >= 1
+    e21 = EXPECTED["scan_0021.pdf"]
+    assert e21["total"] == "455.40" and e21["flags"] == ""
+    pages22 = build_doc22()
+    assert len(pages22) >= 1
+    e22 = EXPECTED["scan_0022.pdf"]
+    assert e22["total"] == "1550.00" and e22["flags"] == ""
     print("demo() self-check passed")
 
 

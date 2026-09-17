@@ -1,21 +1,30 @@
 """Tests for the pure (non-model) logic in capture.py. Run: python test_capture.py"""
+import csv
 import json
+import tempfile
 from datetime import date
+from pathlib import Path
 
 from capture import (
     apply_rules,
     build_new_filename,
     compute_due,
     compute_flags,
+    compute_reviewed,
     duplicate_check,
+    export_dir,
     find_totals,
+    load_vendors,
     make_error_record,
     match_vendor,
     math_check,
+    normalize_payment_method,
     parse_date,
     parse_money,
     parse_model_json,
+    qbo_expense_rows,
     qbo_rows,
+    read_reviewed_map,
     safe_slug,
     strip_json_fences,
     to_review_row,
@@ -103,7 +112,7 @@ def test_compute_due():
 
 
 def test_math_check():
-    # both checks pass
+    # both checks pass (no shipping/discount)
     ok = {"line_items": [{"amount": 100.0}, {"amount": 50.0}], "subtotal": 150.0,
           "tax": 12.0, "total": 162.0}
     assert math_check(ok) == ""
@@ -114,19 +123,35 @@ def test_math_check():
     note = math_check(bad_lines)
     assert "lines sum 141.00, subtotal 150.00" in note
 
-    # subtotal+tax vs total mismatch
+    # subtotal - discount + shipping + tax vs total mismatch
     bad_total = {"line_items": [{"amount": 150.0}], "subtotal": 150.0, "tax": 12.0, "total": 200.0}
     note = math_check(bad_total)
-    assert "subtotal + tax 162.00, total 200.00" in note
+    assert "subtotal - discount + shipping + tax 162.00, total 200.00" in note
 
-    # subtotal null: falls back to sum(lines) + tax vs total
+    # subtotal null: falls back to sum(lines) - discount + shipping + tax vs total
     no_subtotal_ok = {"line_items": [{"amount": 100.0}], "subtotal": None, "tax": 8.0, "total": 108.0}
     assert math_check(no_subtotal_ok) == ""
     no_subtotal_bad = {"line_items": [{"amount": 100.0}], "subtotal": None, "tax": 8.0, "total": 200.0}
-    assert "lines + tax" in math_check(no_subtotal_bad)
+    assert "lines - discount + shipping + tax" in math_check(no_subtotal_bad)
 
     # missing numbers -- nothing to check, no error
     assert math_check({"line_items": [], "subtotal": None, "tax": None, "total": None}) == ""
+
+    # shipping: subtotal + shipping + tax = total -- passes
+    shipping_ok = {"line_items": [{"amount": 400.0}], "subtotal": 400.0, "tax": 12.0,
+                    "shipping": 9.00, "total": 421.0}
+    assert math_check(shipping_ok) == ""
+
+    # discount: subtotal - discount + tax = total -- passes
+    discount_ok = {"line_items": [{"amount": 400.0}], "subtotal": 400.0, "tax": 12.0,
+                    "discount": 50.0, "total": 362.0}
+    assert math_check(discount_ok) == ""
+
+    # both, and it's wrong -- fails with the combined note
+    both_bad = {"line_items": [{"amount": 400.0}], "subtotal": 400.0, "tax": 12.0,
+                "shipping": 9.0, "discount": 0.0, "total": 421.0 + 9.00}  # +9 off from ok
+    note = math_check(both_bad)
+    assert "subtotal - discount + shipping + tax 421.00, total 430.00" in note
 
 
 def test_duplicate_check():
@@ -239,6 +264,7 @@ def test_to_review_row():
         "invoice_number": "INV-100", "invoice_date": "09/16/2026", "due": "10/16/2026",
         "total": 162.5, "category": "Office Supplies", "flags": ["DUE_SOON", "MISSING_INFO"],
         "notes": ["Missing: po number"], "needs_review": True, "new_file": "Northwind_INV100.pdf",
+        "reviewed": "",
     }
     row = to_review_row(record)
     assert row == {
@@ -246,10 +272,12 @@ def test_to_review_row():
         "invoice_no": "INV-100", "date": "09/16/2026", "due": "10/16/2026", "total": "162.50",
         "category": "Office Supplies", "flags": "DUE_SOON;MISSING_INFO",
         "notes": "Missing: po number", "needs_review": "True", "new_file": "Northwind_INV100.pdf",
+        "reviewed": "",
     }
 
     blank = to_review_row({"source_file": "x.pdf", "document_type": "statement"})
     assert blank["total"] == "" and blank["needs_review"] == "False" and blank["flags"] == ""
+    assert blank["reviewed"] == ""
 
 
 def test_qbo_rows():
@@ -278,11 +306,57 @@ def test_qbo_rows():
     assert len(rows) == 1
     assert rows[0]["LineDescription"] == "Fuel purchase" and rows[0]["LineAmount"] == "42.00"
 
-    # excluded: DUPLICATE, MARKED_PAID, and non-invoice document types (receipts)
+    # qbo_vendor (client's QuickBooks spelling) takes priority over vendor for Supplier
+    renamed = {**invoice, "vendor": "Northwind Supply", "qbo_vendor": "Northwind Supply Inc"}
+    assert qbo_rows(renamed)[0]["Supplier"] == "Northwind Supply Inc"
+
+    # excluded: DUPLICATE, MARKED_PAID, and non-invoice document types (receipts, statements)
     assert qbo_rows({**invoice, "flags": ["DUPLICATE"]}) == []
     assert qbo_rows({**invoice, "flags": ["MARKED_PAID"]}) == []
     assert qbo_rows({**invoice, "document_type": "receipt"}) == []
     assert qbo_rows({**invoice, "document_type": "statement"}) == []
+
+
+def test_normalize_payment_method():
+    assert normalize_payment_method("VISA ****4477 APPROVED") == "Credit Card"
+    assert normalize_payment_method("MASTERCARD ****9910") == "Credit Card"
+    assert normalize_payment_method("CASH TENDERED $60.00 CHANGE $1.60") == "Cash"
+    assert normalize_payment_method("Check 1042") == "Check"
+    assert normalize_payment_method("Cheque 1042") == "Check"
+    assert normalize_payment_method("Store credit") == "Store credit"  # printed as-is
+    assert normalize_payment_method(None) == ""
+    assert normalize_payment_method("") == ""
+
+
+def test_qbo_expense_rows():
+    receipt = {
+        "document_type": "receipt", "flags": [], "invoice_number": None,
+        "vendor": "Maple Hardware", "qbo_vendor": "Maple Hardware",
+        "invoice_date": "09/10/2026", "category": "Job Materials", "source_file": "scan_0009.pdf",
+        "currency": "USD", "tax": 4.50, "payment_method": "VISA ****4477 APPROVED",
+        "line_items": [{"description": "Lumber", "amount": 60.00}],
+    }
+    rows = qbo_expense_rows(receipt)
+    assert len(rows) == 2  # 1 line item + 1 sales tax row
+    assert rows[0]["Category Description"] == "Lumber" and rows[0]["Category Line Amount"] == "60.00"
+    assert rows[1]["Category Description"] == "Sales tax" and rows[1]["Category Line Amount"] == "4.50"
+    for r in rows:
+        assert r["Payee"] == "Maple Hardware" and r["Payment Method"] == "Credit Card"
+        assert r["Category Account"] == "Job Materials" and r["Memo"] == "scan_0009.pdf"
+        assert r["Account"] == ""  # bank/card account left for the bookkeeper
+        assert r["Payment Date"] == "09/10/2026"
+
+    # no line items -> one row from subtotal/total + summary
+    no_items = {"document_type": "receipt", "flags": [], "vendor": "Quik Fuel 12",
+                "line_items": [], "subtotal": None, "total": 38.20, "summary": "Fuel",
+                "payment_method": "Cash", "tax": None}
+    rows = qbo_expense_rows(no_items)
+    assert len(rows) == 1
+    assert rows[0]["Category Description"] == "Fuel" and rows[0]["Category Line Amount"] == "38.20"
+
+    # excluded: DUPLICATE, and non-receipt document types
+    assert qbo_expense_rows({**receipt, "flags": ["DUPLICATE"]}) == []
+    assert qbo_expense_rows({**receipt, "document_type": "invoice"}) == []
 
 
 def test_make_error_record_through_apply_rules():
@@ -327,6 +401,39 @@ def test_apply_rules_end_to_end():
     apply_rules(dup, VENDORS, [], today, [first])
     assert dup["flags"] == ["DUPLICATE", "DUE_SOON"]
     assert "scan_0001.pdf" in dup["notes"][0]
+
+    # duplicate check against the ledger ignores a ledger row that is this record's own
+    # source_file (an exported bill rerunning must not flag itself)
+    ledger = [{"vendor": "Northwind Supply", "invoice_no": "INV-500", "date": "08/20/2026",
+               "total": "216.00", "source_file": "scan_0001.pdf"}]
+    rerun_self = {**first, "source_file": "scan_0001.pdf"}
+    apply_rules(rerun_self, VENDORS, ledger, today, [])
+    assert "DUPLICATE" not in rerun_self["flags"]
+
+    # a different file with the same vendor+invoice number IS flagged against that ledger row
+    other_file = {**first, "source_file": "scan_0003.pdf"}
+    apply_rules(other_file, VENDORS, ledger, today, [])
+    assert "DUPLICATE" in other_file["flags"]
+
+    # qbo_vendor: vendors.csv qbo_vendor_name wins, blank falls back to canonical vendor_name
+    vendors_with_qbo = [
+        {"vendor_name": "Northwind Supply", "qbo_vendor_name": "Northwind Supply Inc",
+         "default_category": "Office Supplies", "default_terms": "Net 30", "notes": ""},
+        {"vendor_name": "Quik Fuel", "qbo_vendor_name": "", "default_category": "Fuel",
+         "default_terms": "Due on receipt", "notes": ""},
+    ]
+    renamed = {**first, "source_file": "scan_0004.pdf"}
+    apply_rules(renamed, vendors_with_qbo, [], today, [])
+    assert renamed["qbo_vendor"] == "Northwind Supply Inc"
+
+    blank_qbo = {**first, "source_file": "scan_0005.pdf", "vendor_name": "Quik Fuel"}
+    apply_rules(blank_qbo, vendors_with_qbo, [], today, [])
+    assert blank_qbo["qbo_vendor"] == "Quik Fuel"  # blank qbo_vendor_name -> canonical name
+
+    # no match at all -> qbo_vendor falls back to the model's own vendor_name
+    unknown = {**first, "source_file": "scan_0006.pdf", "vendor_name": "Totally Unrelated LLC"}
+    apply_rules(unknown, vendors_with_qbo, [], today, [])
+    assert unknown["qbo_vendor"] == "Totally Unrelated LLC"
 
 
 def test_opencode_event_parsing():
@@ -387,12 +494,146 @@ def test_openai_backend_against_mock_server():
     assert seen["images"] >= 1 and seen["has_prompt"]
 
 
+def test_reviewed_prefill_and_carryover():
+    # new file (no row in the previous review.csv): pre-fill -- "ok" when clean, "" when flagged
+    assert compute_reviewed("scan_0001.pdf", False, {}) == "ok"
+    assert compute_reviewed("scan_0002.pdf", True, {}) == ""
+
+    # existing file: whatever the bookkeeper left survives a rerun, even if it looks
+    # stale for this run's flags -- their decision is never overwritten
+    prior = {"scan_0001.pdf": "skip", "scan_0002.pdf": "ok", "scan_0003.pdf": ""}
+    assert compute_reviewed("scan_0001.pdf", False, prior) == "skip"
+    assert compute_reviewed("scan_0002.pdf", True, prior) == "ok"
+    assert compute_reviewed("scan_0003.pdf", False, prior) == ""  # carried blank, not re-prefilled
+
+
+def test_read_reviewed_map():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "review.csv"
+        assert read_reviewed_map(path) == {}  # no file yet -- nothing to carry over
+
+        with path.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["file", "reviewed"])
+            writer.writeheader()
+            writer.writerow({"file": "scan_0001.pdf", "reviewed": "ok"})
+            writer.writerow({"file": "scan_0002.pdf", "reviewed": ""})
+        assert read_reviewed_map(path) == {"scan_0001.pdf": "ok", "scan_0002.pdf": ""}
+
+
+def test_load_vendors_old_and_new_columns():
+    with tempfile.TemporaryDirectory() as tmp:
+        old_path = Path(tmp) / "vendors_old.csv"
+        old_path.write_text("vendor_name,default_category,default_terms,notes\n"
+                             "Acme Co,Office Supplies,Net 30,\n")
+        rows = load_vendors(old_path)
+        assert rows[0]["vendor_name"] == "Acme Co"
+        assert rows[0].get("qbo_vendor_name") is None  # column doesn't exist at all -- tolerated
+
+        new_path = Path(tmp) / "vendors_new.csv"
+        new_path.write_text("vendor_name,qbo_vendor_name,default_category,default_terms,notes\n"
+                             "Acme Co,Acme Corporation,Office Supplies,Net 30,\n")
+        rows = load_vendors(new_path)
+        assert rows[0]["qbo_vendor_name"] == "Acme Corporation"
+
+
+def test_export_dir():
+    """--export end to end: reviewed=='ok' invoices -> bills, receipts -> expenses, skip/blank
+    held, non-invoice/receipt 'ok' rows warned-and-skipped, ledger append is idempotent."""
+    records = [
+        {"source_file": "scan_0001.pdf", "document_type": "invoice", "vendor": "Northwind Supply",
+         "qbo_vendor": "Northwind Supply", "invoice_number": "INV-700", "invoice_date": "09/01/2026",
+         "due": "10/01/2026", "terms": "Net 30", "category": "Office Supplies", "currency": "USD",
+         "tax": None, "subtotal": 100.0, "total": 100.0,
+         "line_items": [{"description": "Paper", "amount": 100.0}], "flags": [], "needs_review": False},
+        {"source_file": "scan_0002.pdf", "document_type": "receipt", "vendor": "Maple Hardware",
+         "qbo_vendor": "Maple Hardware", "invoice_number": None, "invoice_date": "09/05/2026",
+         "category": "Job Materials", "currency": "USD", "tax": None, "subtotal": 20.0, "total": 20.0,
+         "payment_method": "Cash", "line_items": [{"description": "Nails", "amount": 20.0}],
+         "flags": [], "needs_review": False},
+        {"source_file": "scan_0003.pdf", "document_type": "invoice", "vendor": "Cedar Ridge Electric",
+         "qbo_vendor": "Cedar Ridge Electric", "invoice_number": "INV-701", "invoice_date": "09/02/2026",
+         "category": "Utilities", "currency": "USD", "tax": None, "subtotal": 50.0, "total": 50.0,
+         "line_items": [{"description": "Service", "amount": 50.0}], "flags": [], "needs_review": False},
+        {"source_file": "scan_0004.pdf", "document_type": "invoice", "vendor": "Blue Anchor Software",
+         "qbo_vendor": "Blue Anchor Software", "invoice_number": "INV-702", "invoice_date": "09/03/2026",
+         "category": "Software", "currency": "USD", "tax": None, "subtotal": 30.0, "total": 30.0,
+         "line_items": [{"description": "License", "amount": 30.0}], "flags": [], "needs_review": False},
+        {"source_file": "scan_0005.pdf", "document_type": "statement", "vendor": "Granite Peak Consulting",
+         "qbo_vendor": "Granite Peak Consulting", "invoice_number": None, "invoice_date": None,
+         "category": "", "currency": "USD", "tax": None, "subtotal": None, "total": None,
+         "line_items": [], "flags": ["NOT_INVOICE"], "needs_review": True},
+        {"source_file": "scan_0006.pdf", "document_type": "invoice", "vendor": "Northwind Supply",
+         "qbo_vendor": "Northwind Supply", "invoice_number": "INV-700", "invoice_date": "09/01/2026",
+         "category": "Office Supplies", "currency": "USD", "tax": None, "subtotal": 100.0, "total": 100.0,
+         "line_items": [{"description": "Paper", "amount": 100.0}], "flags": ["DUPLICATE"],
+         "needs_review": True},
+    ]
+    reviewed = {"scan_0001.pdf": "ok", "scan_0002.pdf": "ok", "scan_0003.pdf": "skip",
+                "scan_0004.pdf": "", "scan_0005.pdf": "ok", "scan_0006.pdf": "ok"}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "out"
+        out.mkdir()
+        (out / "results.json").write_text(json.dumps(records))
+        with (out / "review.csv").open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["file", "reviewed"])
+            writer.writeheader()
+            for src, rv in reviewed.items():
+                writer.writerow({"file": src, "reviewed": rv})
+
+        ledger_path = Path(tmp) / "ledger.csv"
+        with ledger_path.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["vendor", "invoice_no", "date", "total", "source_file"])
+            writer.writeheader()
+            writer.writerow({"vendor": "Old Vendor", "invoice_no": "OLD-1", "date": "01/01/2026",
+                             "total": "5.00", "source_file": "old_scan.pdf"})
+
+        export_dir(out, str(ledger_path))
+
+        bills = list(csv.DictReader((out / "quickbooks_bills.csv").open(newline="")))
+        assert len(bills) == 1  # only scan_0001 (invoice, ok); scan_0006 is DUPLICATE
+        assert bills[0]["BillNo"] == "INV-700" and bills[0]["LineAmount"] == "100.00"
+
+        expenses = list(csv.DictReader((out / "quickbooks_expenses.csv").open(newline="")))
+        assert len(expenses) == 1  # only scan_0002 (receipt, ok)
+        assert expenses[0]["Category Description"] == "Nails"
+
+        ledger_rows = list(csv.DictReader(ledger_path.open(newline="")))
+        assert len(ledger_rows) == 3  # 1 pre-existing + scan_0001 + scan_0002
+        assert {r["source_file"] for r in ledger_rows} == {"old_scan.pdf", "scan_0001.pdf", "scan_0002.pdf"}
+
+        # idempotent: exporting again (nothing changed) does not duplicate ledger rows
+        export_dir(out, str(ledger_path))
+        ledger_rows_2 = list(csv.DictReader(ledger_path.open(newline="")))
+        assert len(ledger_rows_2) == 3
+
+
 def main():
     tests = [v for k, v in globals().items() if k.startswith("test_") and callable(v)]
     for t in tests:
         t()
         print(f"  ok: {t.__name__}")
     print("OK")
+
+def test_export_lines_balance():
+    from capture import export_lines
+    # clean: lines + shipping - discount + tax == total
+    rec = {"total": 455.40, "tax": 30.40, "shipping": 45.00, "discount": None,
+           "line_items": [{"description": "A", "amount": 380.00}], "summary": "s"}
+    lines = export_lines(rec)
+    assert [d for d, _ in lines] == ["A", "Shipping", "Sales tax"]
+    assert abs(sum(a for _, a in lines) - 455.40) < 0.005
+    rec = {"total": 1550.00, "tax": None, "discount": 50.00,
+           "line_items": [{"description": "A", "amount": 1600.00}], "summary": "s"}
+    assert export_lines(rec) == [("A", 1600.00), ("Discount", -50.00)]
+    # a line amount missing -> one line for the total
+    rec = {"total": 58.40, "tax": None, "line_items": [{"description": "fuel", "amount": None}], "summary": "Fuel receipt"}
+    assert export_lines(rec) == [("Fuel receipt", 58.40)]
+    # lines present but do not add up (math error) -> one line for the total, tax kept separate
+    rec = {"total": 333.72, "tax": 24.72, "line_items": [{"description": "A", "amount": 300.00}], "summary": "s"}
+    lines = export_lines(rec)
+    assert lines == [("s", 309.00), ("Sales tax", 24.72)]
+    assert export_lines({"total": None, "line_items": []}) == []
 
 
 if __name__ == "__main__":

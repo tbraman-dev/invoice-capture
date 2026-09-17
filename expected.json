@@ -215,5 +215,27 @@
     "flags": "DUPLICATE",
     "needs_review": "True",
     "category": "Office Supplies"
+  },
+  "scan_0021.pdf": {
+    "type": "invoice",
+    "vendor": "Northwind Supply Co.",
+    "invoice_no": "INV-10475",
+    "date": "09/16/2026",
+    "due": "10/16/2026",
+    "total": "455.40",
+    "flags": "",
+    "needs_review": "False",
+    "category": "Office Supplies"
+  },
+  "scan_0022.pdf": {
+    "type": "invoice",
+    "vendor": "Blue Anchor Software",
+    "invoice_no": "BAS-5610",
+    "date": "09/16/2026",
+    "due": "10/11/2026",
+    "total": "1550.00",
+    "flags": "",
+    "needs_review": "False",
+    "category": "Software"
   }
 }
