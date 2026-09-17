@@ -42,7 +42,7 @@ VENDORS = [
 
 
 def test_safe_slug():
-    assert safe_slug("St. Mary's Clinic!") == "St_Mary_s_Clinic"
+    assert safe_slug("St. Mary's Supply!") == "St_Mary_s_Supply"
     assert safe_slug(None) == "unknown"
     assert safe_slug("") == "unknown"
     assert safe_slug("a" * 100) == "a" * 40
