@@ -1,0 +1,4 @@
+invoices_out*/
+__pycache__/
+*.png
+# keep PDFs and CSVs in repo (they're fake data for testing)

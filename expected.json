@@ -1,0 +1,219 @@
+{
+  "scan_0001.pdf": {
+    "type": "invoice",
+    "vendor": "Northwind Supply Co.",
+    "invoice_no": "INV-10441",
+    "date": "09/16/2026",
+    "due": "10/16/2026",
+    "total": "955.80",
+    "flags": "",
+    "needs_review": "False",
+    "category": "Office Supplies"
+  },
+  "scan_0002.pdf": {
+    "type": "invoice",
+    "vendor": "Cedar Ridge Electric",
+    "invoice_no": "CRE-88213",
+    "date": "08/20/2026",
+    "due": "09/19/2026",
+    "total": "1842.30",
+    "flags": "DUE_SOON",
+    "needs_review": "True",
+    "category": "Utilities"
+  },
+  "scan_0003.pdf": {
+    "type": "invoice",
+    "vendor": "Blue Anchor Software",
+    "invoice_no": "BAS-5521",
+    "date": "09/16/2026",
+    "due": "10/11/2026",
+    "total": "1400.00",
+    "flags": "",
+    "needs_review": "False",
+    "category": "Software"
+  },
+  "scan_0004.pdf": {
+    "type": "invoice",
+    "vendor": "Granite Peak Consulting",
+    "invoice_no": "GPC-30045",
+    "date": "09/16/2026",
+    "due": "10/26/2026",
+    "total": "4500.00",
+    "flags": "",
+    "needs_review": "False",
+    "category": "Professional Fees"
+  },
+  "scan_0005.pdf": {
+    "type": "invoice",
+    "vendor": "Apex Repair & Maintenance",
+    "invoice_no": "ARM-9987",
+    "date": "09/16/2026",
+    "due": "10/21/2026",
+    "total": "545.40",
+    "flags": "",
+    "needs_review": "False",
+    "category": "Repairs and Maintenance"
+  },
+  "scan_0006.pdf": {
+    "type": "invoice",
+    "vendor": "Fieldstone Job Materials",
+    "invoice_no": "FJM-2210",
+    "date": "09/16/2026",
+    "due": "",
+    "total": "994.68",
+    "flags": "",
+    "needs_review": "False",
+    "category": "Job Materials"
+  },
+  "scan_0007.pdf": {
+    "type": "invoice",
+    "vendor": "Silverline Print & Copy",
+    "invoice_no": "SPC-6634",
+    "date": "09/16/2026",
+    "due": "10/01/2026",
+    "total": "367.20",
+    "flags": "",
+    "needs_review": "False",
+    "category": "Office Supplies"
+  },
+  "scan_0008.pdf": {
+    "type": "invoice",
+    "vendor": "Trailhead Restoration Co.",
+    "invoice_no": "TRC-1187",
+    "date": "09/16/2026",
+    "due": "10/14/2026",
+    "total": "1620.00",
+    "flags": "UNKNOWN_VENDOR",
+    "needs_review": "True",
+    "category": ""
+  },
+  "scan_0009.pdf": {
+    "type": "receipt",
+    "vendor": "Maple Hardware",
+    "invoice_no": "R-88214",
+    "date": "09/14/2026",
+    "due": "",
+    "total": "42.17",
+    "flags": "",
+    "needs_review": "False",
+    "category": "Job Materials"
+  },
+  "scan_0010.pdf": {
+    "type": "receipt",
+    "vendor": "Quik Fuel 12",
+    "invoice_no": "",
+    "date": "09/15/2026",
+    "due": "",
+    "total": "58.40",
+    "flags": "",
+    "needs_review": "False",
+    "category": "Fuel"
+  },
+  "scan_0011.pdf": {
+    "type": "receipt",
+    "vendor": "Daily Grind Coffee",
+    "invoice_no": "",
+    "date": "09/13/2026",
+    "due": "",
+    "total": "6.75",
+    "flags": "UNKNOWN_VENDOR",
+    "needs_review": "True",
+    "category": ""
+  },
+  "scan_0012.pdf": {
+    "type": "receipt",
+    "vendor": "Corner Market Mart",
+    "invoice_no": "0004417",
+    "date": "09/15/2026",
+    "due": "",
+    "total": "23.58",
+    "flags": "UNKNOWN_VENDOR",
+    "needs_review": "True",
+    "category": ""
+  },
+  "scan_0013.pdf": {
+    "type": "invoice",
+    "vendor": "Northwind Supply Co.",
+    "invoice_no": "INV-10441",
+    "date": "09/16/2026",
+    "due": "10/16/2026",
+    "total": "955.80",
+    "flags": "DUPLICATE",
+    "needs_review": "True",
+    "category": "Office Supplies"
+  },
+  "scan_0014.pdf": {
+    "type": "invoice",
+    "vendor": "Blue Anchor Software",
+    "invoice_no": "BAS-5588",
+    "date": "09/18/2026",
+    "due": "10/13/2026",
+    "total": "1400.00",
+    "flags": "DUPLICATE",
+    "needs_review": "True",
+    "category": "Software"
+  },
+  "scan_0015.pdf": {
+    "type": "credit_memo",
+    "vendor": "Northwind Supply Co.",
+    "invoice_no": "CM-3390",
+    "date": "09/16/2026",
+    "due": "",
+    "total": "-180.00",
+    "flags": "CREDIT_MEMO",
+    "needs_review": "True",
+    "category": "Office Supplies"
+  },
+  "scan_0016.pdf": {
+    "type": "statement",
+    "vendor": "Cedar Ridge Electric",
+    "date": "09/16/2026",
+    "flags": "NOT_INVOICE",
+    "needs_review": "True",
+    "category": "Utilities"
+  },
+  "scan_0017.pdf": {
+    "type": "invoice",
+    "vendor": "Apex Repair & Maintenance",
+    "invoice_no": "ARM-9991",
+    "date": "09/16/2026",
+    "due": "10/16/2026",
+    "total": "333.72",
+    "flags": "MATH_ERROR",
+    "needs_review": "True",
+    "category": "Repairs and Maintenance"
+  },
+  "scan_0018.pdf": {
+    "type": "invoice",
+    "vendor": "Cedar Ridge Electric",
+    "invoice_no": "CRE-88250",
+    "date": "08/02/2026",
+    "due": "09/01/2026",
+    "total": "210.00",
+    "flags": "MARKED_PAID",
+    "needs_review": "True",
+    "category": "Utilities"
+  },
+  "scan_0019.pdf": {
+    "type": "invoice",
+    "vendor": "Silverline Print & Copy",
+    "invoice_no": "SPC-6650",
+    "date": "08/07/2026",
+    "due": "09/06/2026",
+    "total": "432.00",
+    "flags": "OVERDUE",
+    "needs_review": "True",
+    "category": "Office Supplies"
+  },
+  "scan_0020.pdf": {
+    "type": "invoice",
+    "vendor": "Northwind Supply Co.",
+    "invoice_no": "INV-10399",
+    "date": "09/16/2026",
+    "due": "10/16/2026",
+    "total": "610.00",
+    "flags": "DUPLICATE",
+    "needs_review": "True",
+    "category": "Office Supplies"
+  }
+}
