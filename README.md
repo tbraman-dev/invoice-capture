@@ -40,6 +40,7 @@ Scores `invoices_out/review.csv` against `expected.json` (the known answer for e
 |---|---|
 | file | scan_0001.pdf |
 | type | invoice |
+| read_by | text (text layer) or vision (picture) |
 | vendor | Northwind Supply |
 | invoice_no | INV-2024-0142 |
 | date | 09/15/2026 |
@@ -137,3 +138,25 @@ Kimi K3 via OpenCode runs in seconds and rarely misreads (per testing on similar
 - IMAP inbox: scan bill emails, download attachments, extract and route
 - OneDrive: read from shared folder, write results back
 - Hands-free: schedule daily runs via task scheduler
+
+## Text first, vision last
+
+Most emailed vendor invoices are digital PDFs with a real text layer. Scans and phone photos are pictures.
+
+- `capture.py` first reads the text layer with MarkItDown (no OCR). If there is real text (more than 200 characters per page and invoice labels present), the text goes to a text-only model call. No images are sent.
+- If there is little or no text, the file is a picture, and the vision path reads it as before.
+- `review.csv` shows the path in the `read_by` column. `check_results.py` prints accuracy, cost, and time per path.
+- `--no-text-first` forces vision for everything. `--text-model haiku` uses a cheaper model for the text path only.
+- MarkItDown is optional: `pip install "markitdown[pdf]"`. Without it, every document takes the vision path.
+
+Measured on the 22 fake documents (16 digital, 6 pictures), Claude command line, sonnet:
+
+| Run | Fields correct | Cost per document | Time per document |
+|---|---|---|---|
+| Text path, sonnet (16 docs) | 157 of 157 | $0.084 | 5.8 s |
+| Text path, haiku (16 docs) | 156 of 157, the miss was a blank with a flag | $0.032 | 13.0 s |
+| Vision path, sonnet (same 16 docs) | same fields correct | $0.104 | 7.4 s |
+
+Most of the cost per call through the Claude command line is fixed overhead, so the gap is smaller here than on a direct API.
+
+Known limit: a digital PDF with a stamp or handwriting added as an image keeps its text layer, so the text path does not see the stamp.

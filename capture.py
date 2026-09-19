@@ -25,6 +25,17 @@ from pathlib import Path
 # pipeline, and a wrong total or date is a wrong bill.
 DEFAULT_MODEL = "sonnet"
 
+# Text-first routing (round 3): try MarkItDown's PDF text layer before spending a
+# vision call. On by default: on the 22-document set the text path scored 157/157
+# fields at lower cost. --no-text-first forces vision for everything.
+TEXT_FIRST_DEFAULT = True
+
+# Labels that show up on real billing documents -- has_real_text() requires at
+# least 2, so a text layer that's just a watermark or a stray OCR line of digits
+# doesn't get routed to the text path.
+TEXT_LABELS = ("invoice", "total", "amount", "due", "date", "receipt", "statement",
+               "credit", "bill to", "qty", "description")
+
 FIELDS_PROMPT = """Read the invoice PDF at this path: {pdf_path}
 
 It is a scanned or photographed billing document (invoice, receipt, statement, or
@@ -38,7 +49,7 @@ vendor_address (string or null)
 vendor_phone (string or null)
 vendor_email (string or null)
 invoice_number (string or null -- exactly as printed, e.g. "INV-10442")
-invoice_date (string or null -- MM/DD/YYYY)
+invoice_date (string or null -- MM/DD/YYYY; the document's issue date, for a statement the statement date)
 due_date (string or null -- MM/DD/YYYY, only if printed)
 po_number (string or null)
 currency (string or null -- ISO code; "USD" when a $ sign is seen)
@@ -64,16 +75,114 @@ entry per printed line; never combine two lines into one. All amounts as plain
 numbers with no currency symbols or thousands commas. All dates as MM/DD/YYYY.
 vendor_name is whoever issued/sent the bill, not the customer being billed
 (bill_to). missing_info lists ONLY fields that are present on the page but
-unreadable or ambiguous -- not fields the document simply doesn't have. Return
+unreadable or ambiguous -- not fields the document simply doesn't have, and never
+remarks about arithmetic or layout (the math is checked separately). Return
 ONLY the JSON object, nothing else.
 """
 
+# Same key list + rules for both paths, one constant: everything from "Extract the
+# billing information" onward, sliced out of FIELDS_PROMPT rather than duplicated.
+_FIELDS_KEYS_AND_RULES = FIELDS_PROMPT[FIELDS_PROMPT.index("Extract the billing information"):]
+
+TEXT_FIELDS_PROMPT = """The document text below was extracted from the PDF's text layer
+(reading order may be column by column -- no file is attached, read only the text
+between the <document> tags). It is a billing document (invoice, receipt, statement,
+or credit memo).
+
+<document>
+{text}
+</document>
+
+""" + _FIELDS_KEYS_AND_RULES
+
+
+def text_layer(pdf_path: Path) -> tuple:
+    """MarkItDown's PDF text layer (no OCR) + page count. Import markitdown lazily:
+    if it isn't installed, returns ("", pages) so everything still works on vision."""
+    import pypdfium2 as pdfium
+    doc = pdfium.PdfDocument(str(pdf_path))
+    try:
+        pages = len(doc)
+    finally:
+        doc.close()
+    try:
+        from markitdown import MarkItDown
+    except ImportError:
+        return "", pages
+    text = MarkItDown().convert(str(pdf_path)).text_content
+    return text or "", pages
+
+
+def has_real_text(text: str, pages: int) -> bool:
+    """More than 200 non-whitespace characters per page, AND at least 2 of the usual
+    invoice/receipt labels present (case-insensitive). Never trust near-empty text,
+    and never trust a text layer that doesn't look like a billing document."""
+    non_ws = len(re.sub(r"\s+", "", text or ""))
+    if non_ws <= 200 * max(pages, 1):
+        return False
+    lower = text.lower()
+    return sum(1 for label in TEXT_LABELS if label in lower) >= 2
+
+
+def run_claude_cli(prompt: str, model: str, allowed_tools: str = "Read") -> tuple:
+    """Run the claude CLI once; -> (parsed fields dict, meta dict). meta holds
+    cost_usd/duration_ms/input_tokens/output_tokens from the JSON envelope (None
+    where the envelope doesn't have them)."""
+    # Prompt goes in via stdin: long prompts with quotes/newlines break the Windows shell.
+    proc = subprocess.run(
+        ["claude.cmd", "-p", "--model", model,
+         "--output-format", "json", "--allowedTools", allowed_tools],
+        input=prompt, capture_output=True, text=True, timeout=180,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"claude exited {proc.returncode}: {proc.stderr.strip()[:300]}")
+    envelope = json.loads(proc.stdout)
+    usage = envelope.get("usage") or {}
+    meta = {
+        "cost_usd": envelope.get("total_cost_usd"),
+        "duration_ms": envelope.get("duration_ms"),
+        "input_tokens": usage.get("input_tokens"),
+        "output_tokens": usage.get("output_tokens"),
+    }
+    return parse_model_json(envelope["result"]), meta
+
 
 def extract(pdf_path: Path, model: str = DEFAULT_MODEL, base_url: str = None,
-            api_key: str = None) -> dict:
+            api_key: str = None, text_first: bool = TEXT_FIRST_DEFAULT,
+            text_model: str = None) -> dict:
     """Call the model to pull structured fields out of one invoice PDF.
 
-    Two backends, same prompt, same JSON contract:
+    Text first (when text_first is on and the PDF has a real text layer): one
+    text-only model call, no images, no file read. Otherwise the vision path,
+    same as always -- whole-page images to the model. Same three backends, same
+    JSON contract, either way.
+    """
+    text, pages = text_layer(pdf_path) if text_first else ("", 0)
+    # ponytail: a digital PDF with a stamp/handwriting added as an image keeps its
+    # text layer, so the text path won't see the stamp -- upgrade path = route to
+    # vision when a page has a large image object as well as text.
+    use_text = text_first and has_real_text(text, pages)
+    for attempt in (1, 2):  # one retry: an empty or non-JSON reply is usually transient
+        try:
+            if use_text:
+                data = extract_text(pdf_path, text, text_model or model, base_url, api_key)
+            else:
+                data = extract_vision(pdf_path, model, base_url, api_key)
+            break
+        except (json.JSONDecodeError, KeyError, RuntimeError):
+            if attempt == 2:
+                raise
+    data["read_by"] = "text" if use_text else "vision"
+    data["text_chars"] = len(text)
+    for key in ("cost_usd", "duration_ms", "input_tokens", "output_tokens"):
+        data.setdefault(key, None)
+    return data
+
+
+def extract_vision(pdf_path: Path, model: str = DEFAULT_MODEL, base_url: str = None,
+                    api_key: str = None) -> dict:
+    """The vision path: whole document pages as images. Two backends, same prompt,
+    same JSON contract:
     - default: the local `claude` CLI (Claude subscription, no API key).
     - base_url given: any OpenAI-compatible chat endpoint that accepts images
       (OpenCode Go in the cloud today, Ollama/vLLM on a GPU box tomorrow).
@@ -83,17 +192,23 @@ def extract(pdf_path: Path, model: str = DEFAULT_MODEL, base_url: str = None,
     if "/" in model:  # "provider/model" means the opencode CLI, e.g. opencode-go/kimi-k3
         return extract_opencode(pdf_path, model)
     prompt = FIELDS_PROMPT.format(pdf_path=str(pdf_path.resolve()))
-    # Prompt goes in via stdin: long prompts with quotes/newlines break the Windows shell.
-    proc = subprocess.run(
-        ["claude.cmd", "-p", "--model", model,
-         "--output-format", "json", "--allowedTools", "Read"],
-        input=prompt, capture_output=True, text=True, timeout=180,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(f"claude exited {proc.returncode}: {proc.stderr.strip()[:300]}")
-    envelope = json.loads(proc.stdout)
-    raw = envelope["result"]
-    return parse_model_json(raw)
+    data, meta = run_claude_cli(prompt, model, allowed_tools="Read")
+    data.update(meta)
+    return data
+
+
+def extract_text(pdf_path: Path, text: str, model: str = DEFAULT_MODEL, base_url: str = None,
+                  api_key: str = None) -> dict:
+    """The text path: the PDF's own text layer goes straight into the prompt, no
+    image, no file read. Same three backends as extract_vision."""
+    prompt = TEXT_FIELDS_PROMPT.format(text=text)
+    if base_url:
+        return extract_openai_text(prompt, model, base_url, api_key)
+    if "/" in model:
+        return extract_opencode_text(prompt, model)
+    data, meta = run_claude_cli(prompt, model, allowed_tools="")
+    data.update(meta)
+    return data
 
 
 def pdf_pages_png_b64(pdf_path: Path, scale: float = 2.0, max_pages: int = 4) -> list:
@@ -115,14 +230,10 @@ def pdf_pages_png_b64(pdf_path: Path, scale: float = 2.0, max_pages: int = 4) ->
     return out
 
 
-def extract_openai(pdf_path: Path, model: str, base_url: str, api_key: str = None) -> dict:
-    """OpenAI-compatible /chat/completions with the document pages attached as images."""
+def post_openai(content: list, model: str, base_url: str, api_key: str = None) -> dict:
+    """POST one /chat/completions message with the given content parts (text, and
+    optionally image_url parts), parse the reply's JSON."""
     import urllib.request
-    prompt = FIELDS_PROMPT.format(pdf_path="(the document pages are attached as images)")
-    content = [{"type": "text", "text": prompt}] + [
-        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}
-        for b64 in pdf_pages_png_b64(pdf_path)
-    ]
     body = json.dumps({"model": model, "messages": [{"role": "user", "content": content}],
                        "temperature": 0, "max_tokens": 4000}).encode()
     req = urllib.request.Request(base_url.rstrip("/") + "/chat/completions", data=body,
@@ -134,6 +245,21 @@ def extract_openai(pdf_path: Path, model: str, base_url: str, api_key: str = Non
     if isinstance(raw, list):  # some servers return content parts
         raw = "".join(p.get("text", "") for p in raw)
     return parse_model_json(raw)
+
+
+def extract_openai(pdf_path: Path, model: str, base_url: str, api_key: str = None) -> dict:
+    """OpenAI-compatible /chat/completions with the document pages attached as images."""
+    prompt = FIELDS_PROMPT.format(pdf_path="(the document pages are attached as images)")
+    content = [{"type": "text", "text": prompt}] + [
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}
+        for b64 in pdf_pages_png_b64(pdf_path)
+    ]
+    return post_openai(content, model, base_url, api_key)
+
+
+def extract_openai_text(prompt: str, model: str, base_url: str, api_key: str = None) -> dict:
+    """OpenAI-compatible /chat/completions, text-only message, no image parts."""
+    return post_openai([{"type": "text", "text": prompt}], model, base_url, api_key)
 
 
 def opencode_text_from_events(stdout: str) -> str:
@@ -152,6 +278,15 @@ def opencode_text_from_events(stdout: str) -> str:
     return "".join(parts)
 
 
+def opencode_run(prompt: str, model: str, files: list) -> dict:
+    # Prompt first: "-f" is an array flag and would swallow a trailing prompt as a file name.
+    proc = subprocess.run(["opencode.exe", "run", prompt, "-m", model, "--format", "json", *files],
+                          capture_output=True, text=True, timeout=300)
+    if proc.returncode != 0:
+        raise RuntimeError(f"opencode exited {proc.returncode}: {proc.stderr.strip()[:300]}")
+    return parse_model_json(opencode_text_from_events(proc.stdout))
+
+
 def extract_opencode(pdf_path: Path, model: str) -> dict:
     """Any model the opencode CLI can reach (its own login, no key handling here)."""
     import base64
@@ -163,12 +298,12 @@ def extract_opencode(pdf_path: Path, model: str) -> dict:
             p = Path(tmp) / f"page{i + 1}.png"
             p.write_bytes(base64.b64decode(b64))
             files += ["-f", str(p)]
-        # Prompt first: "-f" is an array flag and would swallow a trailing prompt as a file name.
-        proc = subprocess.run(["opencode.exe", "run", prompt, "-m", model, "--format", "json", *files],
-                              capture_output=True, text=True, timeout=300)
-    if proc.returncode != 0:
-        raise RuntimeError(f"opencode exited {proc.returncode}: {proc.stderr.strip()[:300]}")
-    return parse_model_json(opencode_text_from_events(proc.stdout))
+        return opencode_run(prompt, model, files)
+
+
+def extract_opencode_text(prompt: str, model: str) -> dict:
+    """opencode CLI, text-only run: same command without -f images."""
+    return opencode_run(prompt, model, [])
 
 
 def ocr_text(pdf_path: Path) -> str:
@@ -206,7 +341,10 @@ def find_amounts(text: str) -> list:
     Fallback for table layouts where OCR emits the label column and the amount column
     separately, so no label sits next to its number."""
     out = []
-    for m in re.finditer(r"\$?\s*((?:\d{1,3}(?:,\d{3})+|\d+)\.\d{2})", text or ""):
+    # OCR noise on photos: "$42 .17" (stray space) and "$4.oo" (letter o for zero)
+    text = re.sub(r"(\d)\s*\.\s*([\doO]{2})\b", lambda m: f"{m.group(1)}.{m.group(2)}", text or "")
+    text = re.sub(r"(?<=\d\.)[\doO]{2}\b", lambda m: m.group(0).replace("o", "0").replace("O", "0"), text)
+    for m in re.finditer(r"\$?\s*((?:\d{1,3}(?:,\d{3})+|\d+)\.\d{2})", text):
         val = float(m.group(1).replace(",", ""))
         if val not in out:
             out.append(val)
@@ -603,8 +741,8 @@ def apply_rules(data: dict, vendors: list, ledger: list, today, earlier_records:
 # Outputs
 # ---------------------------------------------------------------------------
 
-REVIEW_FIELDS = ["file", "type", "vendor", "invoice_no", "date", "due", "total", "category",
-                  "flags", "notes", "needs_review", "new_file", "reviewed"]
+REVIEW_FIELDS = ["file", "type", "read_by", "vendor", "invoice_no", "date", "due", "total",
+                  "category", "flags", "notes", "needs_review", "new_file", "reviewed"]
 
 QBO_FIELDS = ["BillNo", "Supplier", "BillDate", "DueDate", "Terms", "Location", "Memo", "Account",
               "LineDescription", "LineAmount", "LineTaxCode", "LineTaxAmount", "Currency"]
@@ -622,6 +760,7 @@ def to_review_row(record: dict) -> dict:
     return {
         "file": record.get("source_file"),
         "type": record.get("document_type"),
+        "read_by": record.get("read_by") or "",
         "vendor": record.get("vendor") or "",
         "invoice_no": record.get("invoice_number") or "",
         "date": record.get("invoice_date") or "",
@@ -724,7 +863,8 @@ def qbo_expense_rows(record: dict) -> list:
 
 
 def print_summary_table(records: list) -> None:
-    cols = ("file", "type", "vendor", "invoice_no", "total", "due", "flags", "needs_review", "reviewed")
+    cols = ("file", "type", "read_by", "vendor", "invoice_no", "total", "due", "flags",
+            "needs_review", "reviewed")
     rows = [cols]
     for r in records:
         row = to_review_row(r)
@@ -753,7 +893,8 @@ def compute_reviewed(source_file: str, needs_review: bool, prior_map: dict) -> s
 
 def process_dir(input_dir: Path, output_dir: Path, model: str, base_url: str = None,
                 api_key: str = None, today=None, vendors_path="vendors.csv",
-                ledger_path="ledger.csv") -> list:
+                ledger_path="ledger.csv", text_first: bool = TEXT_FIRST_DEFAULT,
+                text_model: str = None) -> list:
     output_dir.mkdir(parents=True, exist_ok=True)
     results_path = output_dir / "results.json"
     existing = []
@@ -774,7 +915,7 @@ def process_dir(input_dir: Path, output_dir: Path, model: str, base_url: str = N
             continue
         print(f"processing {pdf.name} ...")
         try:
-            data = extract(pdf, model, base_url, api_key)
+            data = extract(pdf, model, base_url, api_key, text_first, text_model)
         except Exception as e:  # noqa: BLE001 -- never crash the batch
             data = make_error_record(pdf.name, str(e))
         data["source_file"] = pdf.name
@@ -906,6 +1047,11 @@ def main():
     ap.add_argument("--today", default=None, help="YYYY-MM-DD, default: today")
     ap.add_argument("--vendors", default="vendors.csv")
     ap.add_argument("--ledger", default="ledger.csv")
+    ap.add_argument("--text-first", action=argparse.BooleanOptionalAction, default=TEXT_FIRST_DEFAULT,
+                    help="Try MarkItDown's PDF text layer before falling back to vision "
+                         f"(default: {'on' if TEXT_FIRST_DEFAULT else 'off'})")
+    ap.add_argument("--text-model", default=None,
+                    help="Model for the text path (default: same as --model)")
     args = ap.parse_args()
 
     if args.export:
@@ -920,7 +1066,8 @@ def main():
         sys.exit(f"set {args.api_key_env} to the API key for {args.base_url}")
     today = datetime.strptime(args.today, "%Y-%m-%d").date() if args.today else date.today()
     records = process_dir(Path(args.input_dir), Path(args.output_dir), args.model,
-                          args.base_url, api_key, today, args.vendors, args.ledger)
+                          args.base_url, api_key, today, args.vendors, args.ledger,
+                          args.text_first, args.text_model)
     print()
     print_summary_table(records)
 

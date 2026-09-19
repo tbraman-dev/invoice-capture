@@ -1,6 +1,7 @@
 """Tests for the pure (non-model) logic in capture.py. Run: python test_capture.py"""
 import csv
 import json
+import sys
 import tempfile
 from datetime import date
 from pathlib import Path
@@ -13,7 +14,9 @@ from capture import (
     compute_reviewed,
     duplicate_check,
     export_dir,
+    extract,
     find_totals,
+    has_real_text,
     load_vendors,
     make_error_record,
     match_vendor,
@@ -25,8 +28,10 @@ from capture import (
     qbo_expense_rows,
     qbo_rows,
     read_reviewed_map,
+    REVIEW_FIELDS,
     safe_slug,
     strip_json_fences,
+    text_layer,
     to_review_row,
     total_cross_check,
 )
@@ -260,7 +265,8 @@ def test_build_new_filename_collision():
 
 def test_to_review_row():
     record = {
-        "source_file": "scan_0001.pdf", "document_type": "invoice", "vendor": "Northwind Supply",
+        "source_file": "scan_0001.pdf", "document_type": "invoice", "read_by": "text",
+        "vendor": "Northwind Supply",
         "invoice_number": "INV-100", "invoice_date": "09/16/2026", "due": "10/16/2026",
         "total": 162.5, "category": "Office Supplies", "flags": ["DUE_SOON", "MISSING_INFO"],
         "notes": ["Missing: po number"], "needs_review": True, "new_file": "Northwind_INV100.pdf",
@@ -268,7 +274,7 @@ def test_to_review_row():
     }
     row = to_review_row(record)
     assert row == {
-        "file": "scan_0001.pdf", "type": "invoice", "vendor": "Northwind Supply",
+        "file": "scan_0001.pdf", "type": "invoice", "read_by": "text", "vendor": "Northwind Supply",
         "invoice_no": "INV-100", "date": "09/16/2026", "due": "10/16/2026", "total": "162.50",
         "category": "Office Supplies", "flags": "DUE_SOON;MISSING_INFO",
         "notes": "Missing: po number", "needs_review": "True", "new_file": "Northwind_INV100.pdf",
@@ -277,7 +283,10 @@ def test_to_review_row():
 
     blank = to_review_row({"source_file": "x.pdf", "document_type": "statement"})
     assert blank["total"] == "" and blank["needs_review"] == "False" and blank["flags"] == ""
-    assert blank["reviewed"] == ""
+    assert blank["reviewed"] == "" and blank["read_by"] == ""
+
+    # read_by column sits right after type, per SPEC3 B.6
+    assert REVIEW_FIELDS.index("read_by") == REVIEW_FIELDS.index("type") + 1
 
 
 def test_qbo_rows():
@@ -606,6 +615,123 @@ def test_export_dir():
         export_dir(out, str(ledger_path))
         ledger_rows_2 = list(csv.DictReader(ledger_path.open(newline="")))
         assert len(ledger_rows_2) == 3
+
+
+def test_has_real_text():
+    long_with_labels = "INVOICE #1042\nTotal Due: $100.00\n" + "line of body text. " * 40
+    assert has_real_text(long_with_labels, 1) is True
+    # near-empty text -- a label is present but nowhere near 200 chars
+    assert has_real_text("Total", 1) is False
+    assert has_real_text("", 1) is False
+    # long text but none of the usual billing labels -- not a billing text layer
+    long_no_labels = "lorem ipsum dolor sit amet consectetur adipiscing elit " * 20
+    assert has_real_text(long_no_labels, 1) is False
+    # threshold scales with page count: same text, more pages -> no longer "real"
+    assert has_real_text(long_with_labels, 5) is False
+
+
+def test_text_layer_missing_markitdown():
+    """Simulate markitdown not being installed: import returns "" so the whole
+    pipeline still runs on vision. Page count still comes from pypdfium2."""
+    pdfs = sorted(Path("invoices_in").glob("*.pdf")) if Path("invoices_in").exists() else []
+    if not pdfs:
+        print("  (skipped: no invoices_in PDFs)")
+        return
+    had = "markitdown" in sys.modules
+    prior = sys.modules.get("markitdown")
+    sys.modules["markitdown"] = None  # forces "import markitdown" to raise ImportError
+    try:
+        text, pages = text_layer(pdfs[0])
+    finally:
+        if had:
+            sys.modules["markitdown"] = prior
+        else:
+            sys.modules.pop("markitdown", None)
+    assert text == ""
+    assert pages >= 1
+
+
+def test_extract_routes_text_vs_vision():
+    """extract() routing, with text_layer/extract_text/extract_vision monkeypatched --
+    no model calls, no network, no real PDF needed."""
+    import capture
+    calls = []
+
+    def fake_extract_text(pdf_path, text, model, base_url, api_key):
+        calls.append(("text", model))
+        return {"document_type": "invoice", "total": 1.0}
+
+    def fake_extract_vision(pdf_path, model, base_url, api_key):
+        calls.append(("vision", model))
+        return {"document_type": "invoice", "total": 2.0}
+
+    orig_text_layer, orig_extract_text, orig_extract_vision = (
+        capture.text_layer, capture.extract_text, capture.extract_vision)
+    capture.extract_text = fake_extract_text
+    capture.extract_vision = fake_extract_vision
+    real_text = "INVOICE TOTAL " * 30 + "Amount Due 100.00"
+    try:
+        # real text + labels, text_first on -> text path
+        capture.text_layer = lambda p: (real_text, 1)
+        data = capture.extract(Path("fake.pdf"), text_first=True)
+        assert data["read_by"] == "text" and calls[-1] == ("text", "sonnet")
+        assert data["text_chars"] == len(real_text)
+
+        # near-empty text -> falls back to vision even with text_first on
+        capture.text_layer = lambda p: ("", 1)
+        data = capture.extract(Path("fake.pdf"), text_first=True)
+        assert data["read_by"] == "vision" and calls[-1] == ("vision", "sonnet")
+
+        # text_first off (the default) -> always vision, even with real text present
+        capture.text_layer = lambda p: (real_text, 1)
+        data = capture.extract(Path("fake.pdf"), text_first=False)
+        assert data["read_by"] == "vision"
+        assert data["text_chars"] == 0  # text_layer never called when text_first is off
+
+        # text_model overrides model for the text path only
+        data = capture.extract(Path("fake.pdf"), model="sonnet", text_first=True,
+                               text_model="haiku")
+        assert calls[-1] == ("text", "haiku")
+
+        # cost/duration/token keys are always present, None for a non-claude backend
+        for key in ("cost_usd", "duration_ms", "input_tokens", "output_tokens"):
+            assert key in data and data[key] is None
+    finally:
+        capture.text_layer, capture.extract_text, capture.extract_vision = (
+            orig_text_layer, orig_extract_text, orig_extract_vision)
+
+
+def test_split_by_path():
+    from check_results import split_by_path
+    expected = {"a.pdf": {"vendor": "Acme"}, "b.pdf": {"vendor": "Acme"},
+                "c.pdf": {"vendor": "Widgets"}}
+    review_rows = {"a.pdf": {"vendor": "Acme"}, "b.pdf": {"vendor": "Wrong"},
+                   "c.pdf": {"vendor": "Widgets"}}
+    results_by_file = {
+        "a.pdf": {"read_by": "text", "cost_usd": 0.004, "duration_ms": 6000},
+        "b.pdf": {"read_by": "text", "cost_usd": 0.006, "duration_ms": 8000},
+        "c.pdf": {"read_by": "vision", "cost_usd": 0.04, "duration_ms": 15000},
+    }
+    split = split_by_path(expected, review_rows, results_by_file)
+    assert split["text"]["docs"] == 2 and split["text"]["fields"] == 2
+    assert split["text"]["correct"] == 1  # a.pdf right, b.pdf wrong
+    assert abs(split["text"]["avg_cost"] - 0.005) < 1e-9
+    assert abs(split["text"]["avg_duration"] - 7.0) < 1e-9
+    assert split["vision"]["docs"] == 1 and split["vision"]["correct"] == 1
+    assert abs(split["vision"]["avg_duration"] - 15.0) < 1e-9
+
+    # a doc missing from results.json entirely -> grouped under "unknown", not crashed
+    split2 = split_by_path({"z.pdf": {"vendor": "X"}}, {"z.pdf": {"vendor": "X"}}, {})
+    assert split2["unknown"]["docs"] == 1 and split2["unknown"]["correct"] == 1
+    assert split2["unknown"]["avg_cost"] == 0.0
+
+
+def test_find_amounts_ocr_noise():
+    from capture import find_amounts
+    # real OCR output from a phone-photo receipt: stray space and letter o for zero
+    noisy = "SUBTOTAL TAX TOTAL VISA 4477 APPROVED $28. se $9.67 $38.17 $4.oo $42 .17"
+    got = find_amounts(noisy)
+    assert 42.17 in got and 4.0 in got and 38.17 in got and 9.67 in got, got
 
 
 def main():

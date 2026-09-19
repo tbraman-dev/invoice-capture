@@ -94,8 +94,167 @@ def finalize_page(img, rotate_deg=None, low_contrast=False, speckle=True):
 
 def save_pdf(pages, filename):
     path = os.path.join(OUT_DIR, filename)
-    pages[0].save(path, "PDF", resolution=DPI, save_all=True, append_images=pages[1:])
+    if pages and isinstance(pages[0], DigitalPage):
+        PDFWriter.write(pages, path)
+    else:
+        pages[0].save(path, "PDF", resolution=DPI, save_all=True, append_images=pages[1:])
     return path
+
+
+# ---------------------------------------------------------------------------
+# Digital (real text) PDF backend -- Canvas gives render_invoice/render_
+# statement a draw-like interface (.text/.textlength/.rectangle/.line) that
+# works identically whether it's wrapping a Pillow ImageDraw (raster path,
+# unchanged) or recording ops for the pure-Python PDFWriter below (digital
+# path). Coordinates stay in the existing pixel space (1700x2200 @ 200dpi);
+# PDFWriter scales to points (612x792 @ 72dpi) at write time.
+# ---------------------------------------------------------------------------
+
+class Canvas:
+    def __init__(self, digital, draw=None):
+        self.digital = digital
+        self.draw = draw
+        self.ops = [] if digital else None
+
+    def text(self, xy, s, font=None, fill=0):
+        if self.digital:
+            # PDF Tj doesn't interpret embedded newlines (unlike PIL's
+            # ImageDraw.text) -- split multi-line strings into separate
+            # lines ourselves so layout still matches the raster version.
+            if "\n" in s:
+                ascent, descent = font.getmetrics()
+                line_h = ascent + descent
+                for i, line in enumerate(s.split("\n")):
+                    self.ops.append(("text", xy[0], xy[1] + i * line_h, line, font, fill))
+            else:
+                self.ops.append(("text", xy[0], xy[1], s, font, fill))
+        else:
+            self.draw.text(xy, s, font=font, fill=fill)
+
+    def textlength(self, s, font=None):
+        if self.digital:
+            return font.getlength(s)
+        return self.draw.textlength(s, font=font)
+
+    def rectangle(self, box, outline=None, width=1, fill=None):
+        if self.digital:
+            self.ops.append(("rect", box, outline, width, fill))
+        else:
+            self.draw.rectangle(box, outline=outline, width=width, fill=fill)
+
+    def line(self, points, fill=0, width=1):
+        if self.digital:
+            self.ops.append(("line", points, fill, width))
+        else:
+            self.draw.line(points, fill=fill, width=width)
+
+
+class DigitalPage:
+    """Accumulated Canvas ops for one digital page, pixel-space coords."""
+    __slots__ = ("ops",)
+
+    def __init__(self, ops):
+        self.ops = ops
+
+
+class PDFWriter:
+    """Minimal pure-Python text-PDF writer: base-14 fonts only (Helvetica,
+    Helvetica-Bold, Courier), WinAnsi encoding, real selectable text, lines
+    and rectangles, multi-page, US Letter 612x792pt.
+    ponytail: no compression / xref streams / images -- these are small fake
+    invoices, not real-world PDFs; add if a doc ever needs an embedded image."""
+    PAGE_W_PT, PAGE_H_PT = 612, 792
+    SCALE = 72 / 200  # our raster pages are 200dpi; PDF points are 72dpi
+
+    FONT_NAME = {ARIAL: "Helvetica", ARIAL_BOLD: "Helvetica-Bold", CONSOLA: "Courier"}
+    FONT_RES = {"Helvetica": "F1", "Helvetica-Bold": "F2", "Courier": "F3"}
+
+    @staticmethod
+    def _esc(s):
+        return s.replace("\\", r"\\").replace("(", r"\(").replace(")", r"\)")
+
+    @classmethod
+    def _gray(cls, v):
+        return (v / 255.0) if isinstance(v, (int, float)) else 0.0
+
+    @classmethod
+    def _content_stream(cls, ops):
+        S, H = cls.SCALE, cls.PAGE_H_PT
+        out = []
+        for op in ops:
+            kind = op[0]
+            if kind == "text":
+                _, px, py, s, pil_font, fill = op
+                fname = cls.FONT_NAME.get(getattr(pil_font, "path", None), "Helvetica")
+                fres = cls.FONT_RES[fname]
+                size_pt = pil_font.size * S
+                ascent, _desc = pil_font.getmetrics()
+                x_pt = px * S
+                y_pt = H - (py * S) - ascent * S
+                out.append(f"{cls._gray(fill):.3f} g\nBT /{fres} {size_pt:.2f} Tf "
+                           f"{x_pt:.2f} {y_pt:.2f} Td ({cls._esc(s)}) Tj ET")
+            elif kind == "line":
+                _, points, fill, width = op
+                (x0, y0), (x1, y1) = points
+                w_pt = max(width * S, 0.4)
+                out.append(f"{cls._gray(fill):.3f} G\n{w_pt:.2f} w\n"
+                           f"{x0*S:.2f} {H-y0*S:.2f} m {x1*S:.2f} {H-y1*S:.2f} l S")
+            elif kind == "rect":
+                _, box, outline, width, fill = op
+                x0, y0, x1, y1 = box
+                rx, ry = x0 * S, H - y1 * S
+                rw, rh = (x1 - x0) * S, (y1 - y0) * S
+                if fill is not None:
+                    out.append(f"{cls._gray(fill):.3f} g\n{rx:.2f} {ry:.2f} {rw:.2f} {rh:.2f} re f")
+                if outline is not None:
+                    w_pt = max(width * S, 0.4)
+                    out.append(f"{cls._gray(outline):.3f} G\n{w_pt:.2f} w\n"
+                               f"{rx:.2f} {ry:.2f} {rw:.2f} {rh:.2f} re S")
+        return "\n".join(out)
+
+    @classmethod
+    def write(cls, digital_pages, path):
+        n = len(digital_pages)
+        page_obj = lambda i: 6 + 2 * i
+        content_obj = lambda i: 6 + 2 * i + 1
+        objects = {
+            1: b"<< /Type /Catalog /Pages 2 0 R >>",
+            2: (f"<< /Type /Pages /Kids [{' '.join(f'{page_obj(i)} 0 R' for i in range(n))}] "
+                f"/Count {n} >>").encode("latin-1"),
+            3: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+            4: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>",
+            5: b"<< /Type /Font /Subtype /Type1 /BaseFont /Courier /Encoding /WinAnsiEncoding >>",
+        }
+        for i, dp in enumerate(digital_pages):
+            data = cls._content_stream(dp.ops).encode("latin-1", errors="replace")
+            objects[page_obj(i)] = (
+                f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {cls.PAGE_W_PT} {cls.PAGE_H_PT}] "
+                f"/Resources << /Font << /F1 3 0 R /F2 4 0 R /F3 5 0 R >> >> "
+                f"/Contents {content_obj(i)} 0 R >>"
+            ).encode("latin-1")
+            objects[content_obj(i)] = f"<< /Length {len(data)} >>\nstream\n".encode("latin-1") + data + b"\nendstream"
+
+        max_obj = content_obj(n - 1)
+        header = b"%PDF-1.4\n"
+        chunks = [header]
+        offsets = [0] * (max_obj + 1)
+        pos = len(header)
+        for num in range(1, max_obj + 1):
+            offsets[num] = pos
+            chunk = f"{num} 0 obj\n".encode("latin-1") + objects[num] + b"\nendobj\n"
+            chunks.append(chunk)
+            pos += len(chunk)
+        xref_pos = pos
+        chunks.append(f"xref\n0 {max_obj + 1}\n".encode("latin-1"))
+        chunks.append(b"0000000000 65535 f \n")
+        for num in range(1, max_obj + 1):
+            chunks.append(f"{offsets[num]:010d} 00000 n \n".encode("latin-1"))
+        chunks.append(
+            f"trailer\n<< /Size {max_obj + 1} /Root 1 0 R >>\nstartxref\n{xref_pos}\nendxref\n%%EOF".encode("latin-1")
+        )
+        with open(path, "wb") as f:
+            f.write(b"".join(chunks))
+        return path
 
 
 # ---------------------------------------------------------------------------
@@ -213,10 +372,15 @@ def render_invoice(spec):
     layout, paid_stamp (bool), credit (bool), doc_title (str)."""
     layout = spec["layout"]
     title = spec.get("doc_title", "INVOICE")
+    digital = spec.get("digital", False)
     pages = []
 
-    img = new_page()
-    d = ImageDraw.Draw(img)
+    if digital:
+        img = None
+        d = Canvas(digital=True)
+    else:
+        img = new_page()
+        d = Canvas(digital=False, draw=ImageDraw.Draw(img))
 
     if layout == "box_right":
         y = vendor_block(d, 60, 60, spec["vendor"], spec["address"], spec["phone"], spec["email"])
@@ -269,11 +433,14 @@ def render_invoice(spec):
         first, rest = items[:8], items[8:]
         y = line_item_table(d, 60, y, first, grid=grid)
         d.text((60, 2100), "(continued on page 2)", font=font(20), fill=0)
-        p1 = finalize_page(img)
-        pages.append(p1)
+        pages.append(DigitalPage(d.ops) if digital else finalize_page(img))
 
-        img2 = new_page()
-        d2 = ImageDraw.Draw(img2)
+        if digital:
+            img2 = None
+            d2 = Canvas(digital=True)
+        else:
+            img2 = new_page()
+            d2 = Canvas(digital=False, draw=ImageDraw.Draw(img2))
         d2.text((60, 60), f"{spec['vendor']} - Invoice {spec['invoice_no']} (page 2)", font=font(26, bold=True), fill=0)
         y2 = 140
         y2 = line_item_table(d2, 60, y2, rest, grid=grid)
@@ -281,8 +448,7 @@ def render_invoice(spec):
         totals_block(d2, 1120, y2, spec["subtotal"], spec["tax"], spec["total"],
                      credit=spec.get("credit", False), shipping=spec.get("shipping"),
                      discount=spec.get("discount"))
-        p2 = finalize_page(img2)
-        pages.append(p2)
+        pages.append(DigitalPage(d2.ops) if digital else finalize_page(img2))
         return pages
 
     y = line_item_table(d, 60, y, items, grid=grid)
@@ -292,9 +458,9 @@ def render_invoice(spec):
                  discount=spec.get("discount"))
 
     if spec.get("paid_stamp"):
-        stamp_paid(img, ["PAID", "9/12"])
+        stamp_paid(img, ["PAID", "9/12"])  # only ever set on raster (image-only) specs
 
-    pages.append(finalize_page(img))
+    pages.append(DigitalPage(d.ops) if digital else finalize_page(img))
     return pages
 
 
@@ -387,9 +553,13 @@ def render_receipt(store, address, phone, receipt_date, items, total,
 # Statement (doc 16)
 # ---------------------------------------------------------------------------
 
-def render_statement(vendor, address, phone, statement_date, rows):
-    img = new_page()
-    d = ImageDraw.Draw(img)
+def render_statement(vendor, address, phone, statement_date, rows, digital=False):
+    if digital:
+        img = None
+        d = Canvas(digital=True)
+    else:
+        img = new_page()
+        d = Canvas(digital=False, draw=ImageDraw.Draw(img))
     logo_box(d, 60, 60, vendor)
     vendor_block(d, 60, 210, vendor, address, phone, "billing@" + vendor.lower().replace(" ", "") + ".example.com")
     d.text((60, 340), "STATEMENT OF ACCOUNT", font=font(48, bold=True), fill=0)
@@ -418,7 +588,7 @@ def render_statement(vendor, address, phone, statement_date, rows):
     d.text((60, y), "This is a summary statement, not an invoice. Please remit payment", font=font(20), fill=0)
     y += 28
     d.text((60, y), "per the terms of each individual invoice listed above.", font=font(20), fill=0)
-    return [finalize_page(img)]
+    return [DigitalPage(d.ops)] if digital else [finalize_page(img)]
 
 
 # ---------------------------------------------------------------------------
@@ -467,7 +637,7 @@ def add_expected(fname, **kw):
 # Build all 20 documents
 # ---------------------------------------------------------------------------
 
-def build_doc1():
+def build_doc1(digital=True):
     v = V["northwind"]
     items = [
         ("Copy paper, letter size, case of 10 reams", 40, 6.25, 250.00),
@@ -479,11 +649,12 @@ def build_doc1():
     spec = dict(vendor=v["name"], address=v["address"], phone=v["phone"], email=v["email"],
                 invoice_no="INV-10441", invoice_date=invoice_date, due_date=due_date,
                 due_label=v["terms"], items=items, subtotal=subtotal, tax=tax, total=total,
-                layout="grid_left")
+                layout="grid_left", digital=digital)
     pages = render_invoice(spec)
     add_expected("scan_0001.pdf", type="invoice", vendor=v["name"], invoice_no="INV-10441",
                  date=fmt_date(invoice_date), due=fmt_date(due_date), total=exp_total(total),
-                 flags="", needs_review="False", category=v["category"])
+                 flags="", needs_review="False", category=v["category"],
+                 read_by="text" if digital else "vision")
     return pages
 
 
@@ -495,11 +666,11 @@ def build_doc2():
     spec = dict(vendor=v["name"], address=v["address"], phone=v["phone"], email=v["email"],
                 invoice_no="CRE-88213", invoice_date=invoice_date, due_date=due_date,
                 due_label=v["terms"], items=items, subtotal=subtotal, tax=tax, total=total,
-                layout="box_right")
+                layout="box_right", digital=True)
     pages = render_invoice(spec)
     add_expected("scan_0002.pdf", type="invoice", vendor=v["name"], invoice_no="CRE-88213",
                  date=fmt_date(invoice_date), due=fmt_date(due_date), total=exp_total(total),
-                 flags="DUE_SOON", needs_review="True", category=v["category"])
+                 flags="DUE_SOON", needs_review="True", category=v["category"], read_by="text")
     return pages
 
 
@@ -514,11 +685,11 @@ def build_doc3():
     spec = dict(vendor=v["name"], address=v["address"], phone=v["phone"], email=v["email"],
                 invoice_no="BAS-5521", invoice_date=invoice_date, due_date=due_date,
                 due_label=v["terms"], items=items, subtotal=subtotal, tax=tax, total=total,
-                layout="twocol")
+                layout="twocol", digital=True)
     pages = render_invoice(spec)
     add_expected("scan_0003.pdf", type="invoice", vendor=v["name"], invoice_no="BAS-5521",
                  date=fmt_date(invoice_date), due=fmt_date(due_date), total=exp_total(total),
-                 flags="", needs_review="False", category=v["category"])
+                 flags="", needs_review="False", category=v["category"], read_by="text")
     return pages
 
 
@@ -530,11 +701,11 @@ def build_doc4():
     spec = dict(vendor=v["name"], address=v["address"], phone=v["phone"], email=v["email"],
                 invoice_no="GPC-30045", invoice_date=invoice_date, due_date=due_date,
                 due_label=v["terms"], items=items, subtotal=subtotal, tax=tax, total=total,
-                layout="twopage")
+                layout="twopage", digital=True)
     pages = render_invoice(spec)
     add_expected("scan_0004.pdf", type="invoice", vendor=v["name"], invoice_no="GPC-30045",
                  date=fmt_date(invoice_date), due=fmt_date(due_date), total=exp_total(total),
-                 flags="", needs_review="False", category=v["category"])
+                 flags="", needs_review="False", category=v["category"], read_by="text")
     return pages
 
 
@@ -550,11 +721,11 @@ def build_doc5():
     spec = dict(vendor=v["name"], address=v["address"], phone=v["phone"], email=v["email"],
                 invoice_no="ARM-9987", invoice_date=invoice_date, due_date=due_date,
                 due_label=v["terms"], po="PO-77321", items=items, subtotal=subtotal, tax=tax,
-                total=total, layout="grid_left")
+                total=total, layout="grid_left", digital=True)
     pages = render_invoice(spec)
     add_expected("scan_0005.pdf", type="invoice", vendor=v["name"], invoice_no="ARM-9987",
                  date=fmt_date(invoice_date), due=fmt_date(due_date), total=exp_total(total),
-                 flags="", needs_review="False", category=v["category"])
+                 flags="", needs_review="False", category=v["category"], read_by="text")
     return pages
 
 
@@ -570,11 +741,11 @@ def build_doc6():
     spec = dict(vendor=v["name"], address=v["address"], phone=v["phone"], email=v["email"],
                 invoice_no="FJM-2210", invoice_date=invoice_date, due_date=None,
                 due_label=v["terms"], items=items, subtotal=subtotal, tax=tax, total=total,
-                layout="nogrid")
+                layout="nogrid", digital=True)
     pages = render_invoice(spec)
     add_expected("scan_0006.pdf", type="invoice", vendor=v["name"], invoice_no="FJM-2210",
                  date=fmt_date(invoice_date), due="", total=exp_total(total),
-                 flags="", needs_review="False", category=v["category"])
+                 flags="", needs_review="False", category=v["category"], read_by="text")
     return pages
 
 
@@ -591,11 +762,11 @@ def build_doc7():
     spec = dict(vendor=v["name"], address=v["address"], phone=v["phone"], email=v["email"],
                 invoice_no="SPC-6634", invoice_date=invoice_date, due_date=None,
                 due_label=v["terms"], items=items, subtotal=subtotal, tax=tax, total=total,
-                layout="grid_left")
+                layout="grid_left", digital=True)
     pages = render_invoice(spec)
     add_expected("scan_0007.pdf", type="invoice", vendor=v["name"], invoice_no="SPC-6634",
                  date=fmt_date(invoice_date), due=fmt_date(due_date), total=exp_total(total),
-                 flags="", needs_review="False", category=v["category"])
+                 flags="", needs_review="False", category=v["category"], read_by="text")
     return pages
 
 
@@ -611,11 +782,11 @@ def build_doc8():
     spec = dict(vendor=v["name"], address=v["address"], phone=v["phone"], email=v["email"],
                 invoice_no="TRC-1187", invoice_date=invoice_date, due_date=due_date,
                 due_label="Net 30", items=items, subtotal=subtotal, tax=tax, total=total,
-                layout="nogrid")
+                layout="nogrid", digital=True)
     pages = render_invoice(spec)
     add_expected("scan_0008.pdf", type="invoice", vendor=v["name"], invoice_no="TRC-1187",
                  date=fmt_date(invoice_date), due=fmt_date(due_date), total=exp_total(total),
-                 flags="UNKNOWN_VENDOR", needs_review="True", category="")
+                 flags="UNKNOWN_VENDOR", needs_review="True", category="", read_by="text")
     return pages
 
 
@@ -628,7 +799,7 @@ def build_doc9():
                            receipt_no="R-88214", shadow=True, tax=4.00)
     add_expected("scan_0009.pdf", type="receipt", vendor=v["name"], invoice_no="R-88214",
                  date=fmt_date(rdate), due="", total=exp_total(total),
-                 flags="", needs_review="False", category=v["category"])
+                 flags="", needs_review="False", category=v["category"], read_by="vision")
     return [page]
 
 
@@ -641,7 +812,7 @@ def build_doc10():
                            payment_line="CASH TENDERED $60.00 CHANGE $1.60")
     add_expected("scan_0010.pdf", type="receipt", vendor=v["name"], invoice_no="",
                  date=fmt_date(rdate), due="", total=exp_total(total),
-                 flags="", needs_review="False", category=v["category"])
+                 flags="", needs_review="False", category=v["category"], read_by="vision")
     return [page]
 
 
@@ -654,7 +825,7 @@ def build_doc11():
                            payment_line="MASTERCARD ****9910")
     add_expected("scan_0011.pdf", type="receipt", vendor=name, invoice_no="",
                  date=fmt_date(rdate), due="", total=exp_total(total),
-                 flags="UNKNOWN_VENDOR", needs_review="True", category="")
+                 flags="UNKNOWN_VENDOR", needs_review="True", category="", read_by="vision")
     return [page]
 
 
@@ -667,7 +838,7 @@ def build_doc12():
     page = render_receipt(name, address, phone, rdate, items, total, receipt_no="0004417")
     add_expected("scan_0012.pdf", type="receipt", vendor=name, invoice_no="0004417",
                  date=fmt_date(rdate), due="", total=exp_total(total),
-                 flags="UNKNOWN_VENDOR", needs_review="True", category="")
+                 flags="UNKNOWN_VENDOR", needs_review="True", category="", read_by="vision")
     return [page]
 
 
@@ -682,11 +853,11 @@ def build_doc14():
     spec = dict(vendor=v["name"], address=v["address"], phone=v["phone"], email=v["email"],
                 invoice_no="BAS-5588", invoice_date=invoice_date, due_date=due_date,
                 due_label=v["terms"], items=items, subtotal=subtotal, tax=tax, total=total,
-                layout="twocol")
+                layout="twocol", digital=True)
     pages = render_invoice(spec)
     add_expected("scan_0014.pdf", type="invoice", vendor=v["name"], invoice_no="BAS-5588",
                  date=fmt_date(invoice_date), due=fmt_date(due_date), total=exp_total(total),
-                 flags="DUPLICATE", needs_review="True", category=v["category"])
+                 flags="DUPLICATE", needs_review="True", category=v["category"], read_by="text")
     return pages
 
 
@@ -699,11 +870,11 @@ def build_doc15():
     spec = dict(vendor=v["name"], address=v["address"], phone=v["phone"], email=v["email"],
                 invoice_no="CM-3390", invoice_date=invoice_date, due_date=None, due_label=None,
                 items=items, subtotal=subtotal, tax=tax, total=total, layout="grid_left",
-                credit=True, doc_title="CREDIT MEMO")
+                credit=True, doc_title="CREDIT MEMO", digital=True)
     pages = render_invoice(spec)
     add_expected("scan_0015.pdf", type="credit_memo", vendor=v["name"], invoice_no="CM-3390",
                  date=fmt_date(invoice_date), due="", total=exp_total(-total),
-                 flags="CREDIT_MEMO", needs_review="True", category=v["category"])
+                 flags="CREDIT_MEMO", needs_review="True", category=v["category"], read_by="text")
     return pages
 
 
@@ -715,10 +886,10 @@ def build_doc16():
         ("CRE-88011", dt(-64), 198.75, "Paid"),
         ("CRE-88213", dt(-27), 1842.30, "Open"),
     ]
-    pages = render_statement(v["name"], v["address"], v["phone"], statement_date, rows)
+    pages = render_statement(v["name"], v["address"], v["phone"], statement_date, rows, digital=True)
     add_expected("scan_0016.pdf", type="statement", vendor=v["name"],
                  date=fmt_date(statement_date), flags="NOT_INVOICE", needs_review="True",
-                 category=v["category"])
+                 category=v["category"], read_by="text")
     return pages
 
 
@@ -731,11 +902,11 @@ def build_doc17():
     spec = dict(vendor=v["name"], address=v["address"], phone=v["phone"], email=v["email"],
                 invoice_no="ARM-9991", invoice_date=invoice_date, due_date=due_date,
                 due_label=v["terms"], items=items, subtotal=printed_subtotal, tax=tax,
-                total=total, layout="grid_left")
+                total=total, layout="grid_left", digital=True)
     pages = render_invoice(spec)
     add_expected("scan_0017.pdf", type="invoice", vendor=v["name"], invoice_no="ARM-9991",
                  date=fmt_date(invoice_date), due=fmt_date(due_date), total=exp_total(total),
-                 flags="MATH_ERROR", needs_review="True", category=v["category"])
+                 flags="MATH_ERROR", needs_review="True", category=v["category"], read_by="text")
     return pages
 
 
@@ -751,7 +922,7 @@ def build_doc18():
     pages = render_invoice(spec)
     add_expected("scan_0018.pdf", type="invoice", vendor=v["name"], invoice_no="CRE-88250",
                  date=fmt_date(invoice_date), due=fmt_date(due_date), total=exp_total(total),
-                 flags="MARKED_PAID", needs_review="True", category=v["category"])
+                 flags="MARKED_PAID", needs_review="True", category=v["category"], read_by="vision")
     return pages
 
 
@@ -766,11 +937,11 @@ def build_doc19():
     spec = dict(vendor=v["name"], address=v["address"], phone=v["phone"], email=v["email"],
                 invoice_no="SPC-6650", invoice_date=invoice_date, due_date=due_date,
                 due_label=v["terms"], items=items, subtotal=subtotal, tax=tax, total=total,
-                layout="grid_left")
+                layout="grid_left", digital=True)
     pages = render_invoice(spec)
     add_expected("scan_0019.pdf", type="invoice", vendor=v["name"], invoice_no="SPC-6650",
                  date=fmt_date(invoice_date), due=fmt_date(due_date), total=exp_total(total),
-                 flags="OVERDUE", needs_review="True", category=v["category"])
+                 flags="OVERDUE", needs_review="True", category=v["category"], read_by="text")
     return pages
 
 
@@ -782,11 +953,11 @@ def build_doc20():
     spec = dict(vendor=v["name"], address=v["address"], phone=v["phone"], email=v["email"],
                 invoice_no="INV-10399", invoice_date=invoice_date, due_date=due_date,
                 due_label=v["terms"], items=items, subtotal=subtotal, tax=tax, total=total,
-                layout="box_right")
+                layout="box_right", digital=True)
     pages = render_invoice(spec)
     add_expected("scan_0020.pdf", type="invoice", vendor=v["name"], invoice_no="INV-10399",
                  date=fmt_date(invoice_date), due=fmt_date(due_date), total=exp_total(total),
-                 flags="DUPLICATE", needs_review="True", category=v["category"])
+                 flags="DUPLICATE", needs_review="True", category=v["category"], read_by="text")
     return pages
 
 
@@ -801,11 +972,11 @@ def build_doc21():
     spec = dict(vendor=v["name"], address=v["address"], phone=v["phone"], email=v["email"],
                 invoice_no="INV-10475", invoice_date=invoice_date, due_date=due_date,
                 due_label=v["terms"], items=items, subtotal=subtotal, shipping=shipping,
-                tax=tax, total=total, layout="grid_left")
+                tax=tax, total=total, layout="grid_left", digital=True)
     pages = render_invoice(spec)
     add_expected("scan_0021.pdf", type="invoice", vendor=v["name"], invoice_no="INV-10475",
                  date=fmt_date(invoice_date), due=fmt_date(due_date), total=exp_total(total),
-                 flags="", needs_review="False", category=v["category"])
+                 flags="", needs_review="False", category=v["category"], read_by="text")
     return pages
 
 
@@ -820,11 +991,11 @@ def build_doc22():
     spec = dict(vendor=v["name"], address=v["address"], phone=v["phone"], email=v["email"],
                 invoice_no="BAS-5610", invoice_date=invoice_date, due_date=due_date,
                 due_label=v["terms"], items=items, subtotal=subtotal, discount=discount,
-                tax=tax, total=total, layout="twocol")
+                tax=tax, total=total, layout="twocol", digital=True)
     pages = render_invoice(spec)
     add_expected("scan_0022.pdf", type="invoice", vendor=v["name"], invoice_no="BAS-5610",
                  date=fmt_date(invoice_date), due=fmt_date(due_date), total=exp_total(total),
-                 flags="", needs_review="False", category=v["category"])
+                 flags="", needs_review="False", category=v["category"], read_by="text")
     return pages
 
 
@@ -876,7 +1047,11 @@ def main():
             os.remove(os.path.join(OUT_DIR, fn))
     EXPECTED.clear()
 
-    doc1_pages = build_doc1()
+    # doc1 is now digital; build the raster variant first (only used below
+    # for doc13's image), then the real digital scan_0001.pdf last so its
+    # EXPECTED entry (read_by="text") is the one left standing afterward.
+    doc1_raster_pages = build_doc1(digital=False)
+    doc1_pages = build_doc1(digital=True)
     save_pdf(doc1_pages, "scan_0001.pdf")
     save_pdf(build_doc2(), "scan_0002.pdf")
     doc3_pages = build_doc3()
@@ -891,11 +1066,11 @@ def main():
     save_pdf(build_doc11(), "scan_0011.pdf")
     save_pdf(build_doc12(), "scan_0012.pdf")
 
-    # doc 13: pixel-identical re-render of doc 1 -- reuse the SAME rendered
-    # pages (not a fresh call, which would consume RNG state differently)
-    save_pdf(doc1_pages, "scan_0013.pdf")
+    # doc 13: a re-scan of invoice 1 -- same content, stays an image (unlike
+    # doc1 itself, which is now digital), so it uses the raster pages above.
+    save_pdf(doc1_raster_pages, "scan_0013.pdf")
     add_expected("scan_0013.pdf", **{**EXPECTED["scan_0001.pdf"], "flags": "DUPLICATE",
-                                      "needs_review": "True"})
+                                      "needs_review": "True", "read_by": "vision"})
 
     save_pdf(build_doc14(), "scan_0014.pdf")
     save_pdf(build_doc15(), "scan_0015.pdf")
@@ -923,31 +1098,52 @@ def main():
 
 
 def demo():
-    """ponytail: smallest runnable check -- render doc 1 and confirm a real
-    multi-page-capable PDF comes out, and that money()/exp_total() agree."""
-    os.makedirs(OUT_DIR, exist_ok=True)
-    pages = build_doc1()
-    assert len(pages) >= 1
-    assert pages[0].size == (PAGE_W, PAGE_H)
-    tmp = os.path.join(OUT_DIR, "_selftest.pdf")
-    pages[0].save(tmp, "PDF", resolution=DPI)
-    assert os.path.getsize(tmp) > 1000
-    os.remove(tmp)
+    """ponytail: smallest runnable check -- regenerate the real 22 docs, then
+    confirm money()/exp_total() agree, doc1/doc13's raster-vs-digital split
+    is right, and (SPEC3 A.5) every digital doc's MarkItDown text is real
+    (>200 chars/page, invoice_no + total present) while every image doc
+    stays near-empty."""
+    main()  # regenerates invoices_in/, expected.json, vendors.csv, ledger.csv
+
     assert money(1234.5) == "$1,234.50"
     assert exp_total(-180.0) == "-180.00"
     assert EXPECTED["scan_0001.pdf"]["flags"] == ""
+    assert EXPECTED["scan_0001.pdf"]["read_by"] == "text"
+    assert EXPECTED["scan_0013.pdf"]["read_by"] == "vision"
 
-    # shipping/discount totals-box branch (round 2): render both and check
-    # the printed total agrees with subtotal - discount + shipping + tax.
-    pages21 = build_doc21()
-    assert len(pages21) >= 1
+    # shipping/discount totals-box branch (round 2): subtotal - discount +
+    # shipping + tax must equal the printed total.
     e21 = EXPECTED["scan_0021.pdf"]
     assert e21["total"] == "455.40" and e21["flags"] == ""
-    pages22 = build_doc22()
-    assert len(pages22) >= 1
     e22 = EXPECTED["scan_0022.pdf"]
     assert e22["total"] == "1550.00" and e22["flags"] == ""
-    print("demo() self-check passed")
+
+    import pypdfium2 as pdfium
+    from markitdown import MarkItDown
+    md = MarkItDown()
+
+    n_text = n_vision = 0
+    for fname, exp in EXPECTED.items():
+        path = os.path.join(OUT_DIR, fname)
+        pdf = pdfium.PdfDocument(path)
+        n_pages = len(pdf)
+        pdf.close()
+        text = md.convert(path).text_content
+        chars = len(text)
+        if exp["read_by"] == "text":
+            n_text += 1
+            assert chars > 200 * n_pages, f"{fname}: only {chars} chars for {n_pages} page(s)"
+            if exp.get("invoice_no"):
+                assert exp["invoice_no"] in text, f"{fname}: invoice_no {exp['invoice_no']!r} missing"
+            if exp.get("total"):
+                n = abs(float(exp["total"]))
+                variants = (f"{n:.2f}", f"{n:,.2f}")
+                assert any(v in text for v in variants), f"{fname}: total {exp['total']!r} missing"
+        else:
+            n_vision += 1
+            assert chars < 50, f"{fname}: expected image-only but got {chars} chars"
+    assert n_text == 16 and n_vision == 6, f"expected 16 text / 6 vision docs, got {n_text}/{n_vision}"
+    print(f"demo() self-check passed ({n_text} digital, {n_vision} image, 22 docs total)")
 
 
 if __name__ == "__main__":
